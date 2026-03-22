@@ -1,15 +1,17 @@
 """oneQuant strategy validation suite.
 
-Three stress tests for the Mean Reversion strategy:
-  1. Walk-forward validation (4 × 6-month blocks)
+Four stress tests for the Mean Reversion strategy:
+  1. Walk-forward validation — sliding AND anchored (4 × 6-month blocks)
   2. Monte Carlo simulation (10,000 shuffled equity curves)
   3. Parameter stability sweep (1,500 combinations, parallelised)
+  4. Sharpe significance t-test
 
 Usage:
     cd onequant/
     python validate.py
 """
 
+import math
 import multiprocessing
 import os
 import random
@@ -18,7 +20,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 
-from backtest.engine import BacktestConfig, TradeResult, _ts_range, run_backtest
+from backtest.engine import BacktestConfig, _ts_range, run_backtest
 from backtest.metrics import Metrics, calculate_metrics
 from strategies.mean_reversion import MeanReversionStrategy
 
@@ -36,19 +38,22 @@ if hasattr(sys.stdout, "reconfigure"):
 TIMEFRAME: str = "15m"
 STOP_LOSS_PCT: float = 0.06
 TAKE_PROFIT_PCT: float = 0.03
-FEE_PCT: float = 0.004
-INITIAL_CAPITAL: float = 1000.0
+INITIAL_CAPITAL: float = 25.0
 NUM_BLOCKS: int = 4
 MC_ITERATIONS: int = 10_000
 
+# Minimum trade gates
+MIN_TOTAL_TRADES: int = 100
+MIN_PERIOD_TRADES: int = 30
+
 # ---------------------------------------------------------------------------
-# Test 1 — Walk-forward validation
+# Test 1 — Walk-forward validation (sliding + anchored)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class WalkForwardPeriod:
-    """Results for one train→test pair."""
+    """Results for one train-test pair."""
 
     period: int
     train_wr: float
@@ -70,39 +75,27 @@ def _run_block(start_ts: int, end_ts: int) -> Metrics:
         end_ts=end_ts,
         stop_loss_pct=STOP_LOSS_PCT,
         take_profit_pct=TAKE_PROFIT_PCT,
-        fee_pct=FEE_PCT,
         initial_capital=INITIAL_CAPITAL,
+        order_type="limit",
     )
     result = run_backtest(cfg)
     return calculate_metrics(result)
 
 
-def test_walk_forward() -> bool:
-    """Run walk-forward validation across 4 × 6-month blocks.
-
-    Returns True if average out-of-sample profit factor > 1.0.
-    """
-    print("\n" + "\u2550" * 50)
-    print("  Test 1 — Walk-Forward Validation")
-    print("\u2550" * 50)
-
-    min_ts, max_ts = _ts_range(TIMEFRAME)
-    total_span = max_ts - min_ts
-    block_size = total_span // NUM_BLOCKS
-
-    boundaries: list[int] = []
-    for i in range(NUM_BLOCKS + 1):
-        boundaries.append(min_ts + i * block_size)
-    boundaries[-1] = max_ts  # ensure we cover the full range
-
+def _run_walk_forward(boundaries: list[int], anchored: bool) -> list[WalkForwardPeriod]:
+    """Run walk-forward validation. If anchored, training always starts from day 1."""
     periods: list[WalkForwardPeriod] = []
-    for i in range(NUM_BLOCKS - 1):
-        train_start, train_end = boundaries[i], boundaries[i + 1]
-        test_start, test_end = boundaries[i + 1], boundaries[i + 2]
+    label = "Anchored" if anchored else "Sliding"
 
-        print(f"  Period {i + 1}: training ... ", end="", flush=True)
+    for i in range(NUM_BLOCKS - 1):
+        train_start = boundaries[0] if anchored else boundaries[i]
+        train_end = boundaries[i + 1]
+        test_start = boundaries[i + 1]
+        test_end = boundaries[i + 2]
+
+        print(f"  {label} Period {i + 1}: training ... ", end="", flush=True)
         train_m = _run_block(train_start, train_end)
-        print(f"testing ... ", end="", flush=True)
+        print("testing ... ", end="", flush=True)
         test_m = _run_block(test_start, test_end)
         print("done")
 
@@ -117,25 +110,75 @@ def test_walk_forward() -> bool:
             test_pnl=test_m.total_pnl,
             test_trades=test_m.total_trades,
         ))
+    return periods
 
-    print()
-    print("  Walk-Forward Results \u2014 Mean Reversion")
-    print("  " + "\u2550" * 47)
+
+def _print_wf_table(periods: list[WalkForwardPeriod], label: str) -> float:
+    """Print walk-forward results and return average OOS profit factor."""
+    print(f"\n  {label} Walk-Forward Results")
+    print("  " + "\u2550" * 55)
     for p in periods:
         check = "\u2713" if p.test_pf >= 1.0 else "\u2717"
-        train_str = f"Train {p.train_wr * 100:5.1f}% WR (PF={p.train_pf:.2f}, n={p.train_trades})"
-        test_str = f"Test {p.test_wr * 100:5.1f}% WR (PF={p.test_pf:.2f}, n={p.test_trades})"
+        train_str = f"Train {p.train_wr * 100:5.1f}% WR (PF={min(p.train_pf, 99.9):.2f}, n={p.train_trades})"
+        test_str = f"Test {p.test_wr * 100:5.1f}% WR (PF={min(p.test_pf, 99.9):.2f}, n={p.test_trades})"
         print(f"  Period {p.period}:  {train_str}  \u2502  {test_str}  {check}")
-    print("  " + "\u2500" * 47)
+    print("  " + "\u2500" * 55)
 
-    oos_wrs = [p.test_wr for p in periods]
     oos_pfs = [min(p.test_pf, 10.0) for p in periods]  # cap inf at 10.0
-    avg_oos_wr = sum(oos_wrs) / len(oos_wrs) if oos_wrs else 0.0
     avg_oos_pf = sum(oos_pfs) / len(oos_pfs) if oos_pfs else 0.0
-    consistent = avg_oos_pf > 1.0
+    oos_wrs = [p.test_wr for p in periods]
+    avg_oos_wr = sum(oos_wrs) / len(oos_wrs) if oos_wrs else 0.0
+    print(f"  Avg OOS WR: {avg_oos_wr * 100:.1f}%   Avg OOS PF: {avg_oos_pf:.2f}")
+    return avg_oos_pf
 
-    print(f"  Out-of-sample avg WR:  {avg_oos_wr * 100:.1f}%")
-    print(f"  Out-of-sample avg PF:  {avg_oos_pf:.2f}")
+
+def test_walk_forward() -> bool:
+    """Run both sliding and anchored walk-forward validation.
+
+    Returns True if BOTH average out-of-sample profit factors > 1.0
+    AND total trades meet minimum threshold.
+    """
+    print("\n" + "\u2550" * 60)
+    print("  Test 1 \u2014 Walk-Forward Validation (Sliding + Anchored)")
+    print("\u2550" * 60)
+
+    min_ts, max_ts = _ts_range(TIMEFRAME)
+    total_span = max_ts - min_ts
+    block_size = total_span // NUM_BLOCKS
+
+    boundaries: list[int] = []
+    for i in range(NUM_BLOCKS + 1):
+        boundaries.append(min_ts + i * block_size)
+    boundaries[-1] = max_ts
+
+    # Check total trade count first
+    full_m = _run_block(min_ts, max_ts)
+    total_trades = full_m.total_trades
+
+    if total_trades < MIN_TOTAL_TRADES:
+        print(f"\n  INSUFFICIENT TRADES: {total_trades} trades found, "
+              f"minimum {MIN_TOTAL_TRADES} required for validation.")
+        print("  Loosen entry conditions or extend history.")
+        return False
+
+    # Sliding walk-forward
+    sliding_periods = _run_walk_forward(boundaries, anchored=False)
+    avg_sliding_pf = _print_wf_table(sliding_periods, "Sliding")
+
+    # Anchored walk-forward
+    anchored_periods = _run_walk_forward(boundaries, anchored=True)
+    avg_anchored_pf = _print_wf_table(anchored_periods, "Anchored")
+
+    # Check per-period minimums
+    all_periods = sliding_periods + anchored_periods
+    low_count_periods = [p for p in all_periods if p.test_trades < MIN_PERIOD_TRADES]
+    if low_count_periods:
+        print(f"\n  WARNING: {len(low_count_periods)} period(s) have fewer than "
+              f"{MIN_PERIOD_TRADES} test trades")
+
+    consistent = avg_sliding_pf > 1.0 and avg_anchored_pf > 1.0
+    print(f"\n  Sliding avg PF:  {avg_sliding_pf:.2f}  {'PASS' if avg_sliding_pf > 1.0 else 'FAIL'}")
+    print(f"  Anchored avg PF: {avg_anchored_pf:.2f}  {'PASS' if avg_anchored_pf > 1.0 else 'FAIL'}")
     print(f"  Consistent: {'YES' if consistent else 'NO'}")
 
     return consistent
@@ -151,18 +194,17 @@ def test_monte_carlo() -> bool:
 
     Returns True if > 60% of simulations are profitable.
     """
-    print("\n" + "\u2550" * 50)
-    print("  Test 2 — Monte Carlo Simulation")
-    print("\u2550" * 50)
+    print("\n" + "\u2550" * 60)
+    print("  Test 2 \u2014 Monte Carlo Simulation")
+    print("\u2550" * 60)
 
-    # Run full backtest to get trade list
     cfg = BacktestConfig(
         strategy=MeanReversionStrategy(),
         timeframe=TIMEFRAME,
         stop_loss_pct=STOP_LOSS_PCT,
         take_profit_pct=TAKE_PROFIT_PCT,
-        fee_pct=FEE_PCT,
         initial_capital=INITIAL_CAPITAL,
+        order_type="limit",
     )
     result = run_backtest(cfg)
     trades = result.trades
@@ -174,15 +216,13 @@ def test_monte_carlo() -> bool:
     print(f"  Source trades: {len(trades)}")
     print(f"  Running {MC_ITERATIONS:,} simulations ... ", end="", flush=True)
 
-    # Store each trade's return on its position (pnl_pct).
-    # Replay with 10% position sizing so order matters (equity-dependent sizing).
     trade_pnl_pcts = [t.pnl_pct for t in trades]
     position_size_pct = 0.10
     profitable_count = 0
     final_pnls: list[float] = []
     max_drawdowns: list[float] = []
 
-    rng = random.Random(42)  # reproducible
+    rng = random.Random(42)
 
     for _ in range(MC_ITERATIONS):
         shuffled = trade_pnl_pcts[:]
@@ -193,7 +233,6 @@ def test_monte_carlo() -> bool:
         max_dd = 0.0
 
         for pct in shuffled:
-            # Each trade risks position_size_pct of current equity
             trade_pnl = equity * position_size_pct * pct
             equity += trade_pnl
             if equity > peak:
@@ -237,7 +276,6 @@ def test_monte_carlo() -> bool:
 # Test 3 — Parameter stability sweep
 # ---------------------------------------------------------------------------
 
-# Sweep ranges
 RSI_OVERSOLD_RANGE: list[float] = [15, 18, 20, 22, 25]
 RSI_OVERBOUGHT_RANGE: list[float] = [75, 78, 80, 82, 85]
 EMA_DEV_RANGE: list[float] = [2.0, 2.5, 3.0, 3.5, 4.0]
@@ -264,11 +302,8 @@ def _run_sweep_combo(args: tuple) -> SweepResult:
     """Worker function for one parameter combination (runs in subprocess)."""
     rsi_os, rsi_ob, ema_dev, sl, tp = args
 
-    # Create a patched strategy with custom parameters
     strategy = MeanReversionStrategy()
 
-    # Monkey-patch the module-level constants used by the strategy via
-    # a wrapper that injects custom thresholds
     import strategies.mean_reversion as mr
     original_os = mr.RSI_OVERSOLD
     original_ob = mr.RSI_OVERBOUGHT
@@ -283,8 +318,8 @@ def _run_sweep_combo(args: tuple) -> SweepResult:
             timeframe=TIMEFRAME,
             stop_loss_pct=sl,
             take_profit_pct=tp,
-            fee_pct=FEE_PCT,
             initial_capital=INITIAL_CAPITAL,
+            order_type="limit",
         )
         result = run_backtest(cfg)
         m = calculate_metrics(result)
@@ -312,9 +347,9 @@ def test_parameter_stability() -> bool:
     Returns True if >15% of combinations are profitable AND current
     settings appear in the top quartile by profit factor.
     """
-    print("\n" + "\u2550" * 50)
-    print("  Test 3 — Parameter Stability Sweep")
-    print("\u2550" * 50)
+    print("\n" + "\u2550" * 60)
+    print("  Test 3 \u2014 Parameter Stability Sweep")
+    print("\u2550" * 60)
 
     combos: list[tuple] = []
     for rsi_os in RSI_OVERSOLD_RANGE:
@@ -351,25 +386,22 @@ def test_parameter_stability() -> bool:
     elapsed = time.time() - start
     print(f"\n  Completed in {elapsed:.1f}s\n")
 
-    # Analysis
     profitable = [r for r in results if r.profit_factor > 1.0 and r.trades > 0]
     pct_profitable = len(profitable) / total * 100 if total > 0 else 0.0
 
-    # Sort all by PF descending
     results_sorted = sorted(results, key=lambda r: r.profit_factor, reverse=True)
 
-    # Top 20
     print(f"  Top 20 by Profit Factor")
     print(f"  {'RSI_OS':<7} {'RSI_OB':<7} {'EMA%':<6} {'SL%':<5} {'TP%':<5} "
           f"{'Tr':<5} {'WR%':<7} {'PF':<6} {'P&L':<10}")
     print("  " + "-" * 63)
     for r in results_sorted[:20]:
+        pf_str = f"{r.profit_factor:<6.2f}" if r.profit_factor < 1000 else "inf   "
         print(
             f"  {r.rsi_os:<7.0f} {r.rsi_ob:<7.0f} {r.ema_dev:<6.1f} {r.sl:<5.1f} {r.tp:<5.1f} "
-            f"{r.trades:<5} {r.win_rate * 100:<7.1f} {r.profit_factor:<6.2f} {r.pnl:<10.2f}"
+            f"{r.trades:<5} {r.win_rate * 100:<7.1f} {pf_str} {r.pnl:<10.2f}"
         )
 
-    # Most robust parameters (frequency in profitable set)
     print(f"\n  Parameter Stability Analysis")
     print("  " + "\u2550" * 47)
     print(f"  Total combinations tested:   {total}")
@@ -387,14 +419,13 @@ def test_parameter_stability() -> bool:
         best_tp = tp_counts.most_common(1)[0]
 
         n_prof = len(profitable)
-        print(f"")
+        print()
         print(f"  Most robust RSI oversold:    {best_os[0]:.0f} "
               f"(appears in {best_os[1] * 100 / n_prof:.0f}% of profitable runs)")
         print(f"  Most robust EMA deviation:   {best_dev[0]:.1f}%")
         print(f"  Most robust stop loss:       {best_sl[0]:.1f}%")
         print(f"  Most robust take profit:     {best_tp[0]:.1f}%")
 
-    # Check if current settings are in top quartile
     top_quartile_cutoff = len(results_sorted) // 4
     top_quartile = results_sorted[:top_quartile_cutoff]
     current_in_top_q = any(
@@ -410,23 +441,114 @@ def test_parameter_stability() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Test 4 — Sharpe ratio significance test
+# ---------------------------------------------------------------------------
+
+
+def _t_cdf(t_val: float, df: int) -> float:
+    """CDF of Student's t-distribution via numerical integration (Simpson's rule).
+
+    Avoids scipy dependency while providing reliable results.
+    """
+    if df <= 0:
+        return 0.5
+
+    # PDF: C * (1 + x^2/df)^(-(df+1)/2)
+    log_c = (math.lgamma((df + 1) / 2) - math.lgamma(df / 2)
+             - 0.5 * math.log(df * math.pi))
+    c = math.exp(log_c)
+
+    def pdf(x: float) -> float:
+        return c * (1.0 + x * x / df) ** (-(df + 1) / 2.0)
+
+    # Integrate from 0 to |t| using composite Simpson's rule
+    abs_t = abs(t_val)
+    n_steps = 2000  # even number for Simpson
+    h = abs_t / n_steps
+
+    # Simpson's rule: integral ≈ (h/3) * [f(0) + 4f(h) + 2f(2h) + 4f(3h) + ... + f(nh)]
+    integral = pdf(0.0) + pdf(abs_t)
+    for i in range(1, n_steps):
+        x = i * h
+        if i % 2 == 0:
+            integral += 2.0 * pdf(x)
+        else:
+            integral += 4.0 * pdf(x)
+    integral *= h / 3.0
+
+    # CDF by symmetry: P(T <= t) = 0.5 + integral(0, t) for t >= 0
+    if t_val >= 0:
+        return 0.5 + integral
+    else:
+        return 0.5 - integral
+
+
+def test_sharpe_significance() -> bool:
+    """Test if the strategy's Sharpe ratio is statistically significant.
+
+    Uses a t-test: t_stat = sharpe * sqrt(n_trades)
+    Returns True if p < 0.05.
+    """
+    print("\n" + "\u2550" * 60)
+    print("  Test 4 \u2014 Sharpe Ratio Significance")
+    print("\u2550" * 60)
+
+    cfg = BacktestConfig(
+        strategy=MeanReversionStrategy(),
+        timeframe=TIMEFRAME,
+        stop_loss_pct=STOP_LOSS_PCT,
+        take_profit_pct=TAKE_PROFIT_PCT,
+        initial_capital=INITIAL_CAPITAL,
+        order_type="limit",
+    )
+    result = run_backtest(cfg)
+    m = calculate_metrics(result)
+
+    n = m.total_trades
+    sharpe = m.sharpe_ratio
+
+    if n < 2:
+        print("  Not enough trades for significance test.")
+        return False
+
+    t_stat = sharpe * math.sqrt(n)
+    df = n - 1
+    p_value = 2.0 * (1.0 - _t_cdf(abs(t_stat), df))
+
+    significant = p_value < 0.05
+
+    print(f"  Trades:      {n}")
+    print(f"  Sharpe:      {sharpe:.2f}")
+    print(f"  t-statistic: {t_stat:.3f}")
+    print(f"  p-value:     {p_value:.4f}")
+
+    if significant:
+        print(f"  Result:      Sharpe {sharpe:.2f} (p={p_value:.3f}, statistically significant)")
+    else:
+        print(f"  Result:      Sharpe {sharpe:.2f} (p={p_value:.3f}, NOT significant \u2014 need more trades)")
+
+    return significant
+
+
+# ---------------------------------------------------------------------------
 # Main — run all tests and print final summary
 # ---------------------------------------------------------------------------
 
-BOX_WIDTH: int = 42
+BOX_WIDTH: int = 50
 
 
 def main() -> None:
-    """Run all three validation tests and print the final verdict."""
-    print("=" * 50)
-    print("oneQuant v0.2 \u2014 Strategy Validation Suite")
-    print("=" * 50)
+    """Run all validation tests and print the final verdict."""
+    print("=" * 60)
+    print("oneQuant v0.3 \u2014 Strategy Validation Suite")
+    print("=" * 60)
 
     wf_pass = test_walk_forward()
     mc_pass = test_monte_carlo()
     ps_pass = test_parameter_stability()
+    sh_pass = test_sharpe_significance()
 
-    overall = wf_pass and mc_pass and ps_pass
+    overall = wf_pass and mc_pass and ps_pass and sh_pass
 
     top = "\u2554" + "\u2550" * BOX_WIDTH + "\u2557"
     mid = "\u2560" + "\u2550" * BOX_WIDTH + "\u2563"
@@ -434,7 +556,7 @@ def main() -> None:
 
     def _row(label: str, passed: bool) -> str:
         status = "PASS" if passed else "FAIL"
-        inner = f" {label:<20}{status:>{BOX_WIDTH - 23}} "
+        inner = f" {label:<26}{status:>{BOX_WIDTH - 29}} "
         return f"\u2551{inner}\u2551"
 
     print("\n" + top)
@@ -442,7 +564,8 @@ def main() -> None:
     print(mid)
     print(_row("Walk-forward:", wf_pass))
     print(_row("Monte Carlo:", mc_pass))
-    print(_row("Parameter stab:", ps_pass))
+    print(_row("Parameter stability:", ps_pass))
+    print(_row("Sharpe significance:", sh_pass))
     print(mid)
     verdict = "VALIDATED" if overall else "NOT VALIDATED"
     print(f"\u2551{f' OVERALL: {verdict} ':^{BOX_WIDTH}}\u2551")
