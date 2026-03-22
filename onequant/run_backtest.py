@@ -13,33 +13,37 @@ from strategies.momentum import MomentumStrategy
 from strategies.news_driven import NewsDrivenStrategy
 
 TIMEFRAME: str = "15m"
+CAPITAL: float = 25.0
 
 
 def main() -> None:
     """Run all three strategies against historical 15m candles and compare."""
     print("=" * 50)
-    print("oneQuant v0.2 — Backtest Runner")
+    print("oneQuant v0.3 — Backtest Runner")
     print("=" * 50)
 
     configs = [
         BacktestConfig(
             strategy=MomentumStrategy(),
             timeframe=TIMEFRAME,
+            initial_capital=CAPITAL,
             min_confidence=0.70,
             take_profit_pct=0.04,
             stop_loss_pct=0.05,
-            fee_pct=0.004,
+            order_type="limit",
         ),
         BacktestConfig(
             strategy=MeanReversionStrategy(),
             timeframe=TIMEFRAME,
+            initial_capital=CAPITAL,
             take_profit_pct=0.03,
             stop_loss_pct=0.06,
-            fee_pct=0.004,
+            order_type="limit",
         ),
         BacktestConfig(
             strategy=NewsDrivenStrategy(),
             timeframe=TIMEFRAME,
+            initial_capital=CAPITAL,
         ),
     ]
 

@@ -1,7 +1,8 @@
 """Performance metrics calculated from a list of trade results."""
 
 import math
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from backtest.engine import BacktestResult, TradeResult
@@ -30,30 +31,57 @@ class Metrics:
     worst_trade: float
     trades_per_week: float
 
+    # Fee breakdown
+    avg_fee_pct: float = 0.0
+    fee_tier_breakdown: dict = field(default_factory=dict)
+
+    # Cost breakdown
+    total_slippage: float = 0.0
+    total_spread_cost: float = 0.0
+    gap_stops: int = 0
+
+    # Time analysis
+    performance_by_hour: dict = field(default_factory=dict)
+    performance_by_day: dict = field(default_factory=dict)
+
+    # Regime analysis
+    trades_by_regime: dict = field(default_factory=dict)
+    win_rate_by_regime: dict = field(default_factory=dict)
+    pf_by_regime: dict = field(default_factory=dict)
+
+    # Buy-and-hold benchmark
+    bh_return_pct: float = 0.0
+    bh_max_drawdown: float = 0.0
+    bh_sharpe: float = 0.0
+    alpha_vs_bh: float = 0.0
+
     def is_profitable(self) -> bool:
         """Return True only if win_rate > 55% AND profit_factor > 1.2."""
         return self.win_rate > 0.55 and self.profit_factor > 1.2
 
 
+def _empty_metrics() -> Metrics:
+    """Return a zeroed-out Metrics for runs with no trades."""
+    return Metrics(
+        total_trades=0, winning_trades=0, losing_trades=0,
+        win_rate=0.0, total_pnl=0.0, total_pnl_pct=0.0,
+        avg_win=0.0, avg_loss=0.0, profit_factor=0.0,
+        max_drawdown=0.0, sharpe_ratio=0.0, avg_confidence=0.0,
+        total_fees=0.0, best_trade=0.0, worst_trade=0.0,
+        trades_per_week=0.0,
+    )
+
+
 def calculate_metrics(result: BacktestResult) -> Metrics:
-    """Compute all performance metrics from a backtest result.
-
-    Args:
-        result: A BacktestResult containing the trade list and run metadata.
-
-    Returns:
-        A Metrics dataclass with all calculated statistics.
-    """
+    """Compute all performance metrics from a backtest result."""
     trades = result.trades
     if not trades:
-        return Metrics(
-            total_trades=0, winning_trades=0, losing_trades=0,
-            win_rate=0.0, total_pnl=0.0, total_pnl_pct=0.0,
-            avg_win=0.0, avg_loss=0.0, profit_factor=0.0,
-            max_drawdown=0.0, sharpe_ratio=0.0, avg_confidence=0.0,
-            total_fees=0.0, best_trade=0.0, worst_trade=0.0,
-            trades_per_week=0.0,
-        )
+        m = _empty_metrics()
+        if result.buy_and_hold:
+            m.bh_return_pct = result.buy_and_hold.return_pct
+            m.bh_max_drawdown = result.buy_and_hold.max_drawdown
+            m.bh_sharpe = result.buy_and_hold.sharpe
+        return m
 
     wins = [t for t in trades if t.outcome == "WIN"]
     losses = [t for t in trades if t.outcome == "LOSS"]
@@ -71,10 +99,7 @@ def calculate_metrics(result: BacktestResult) -> Metrics:
 
     profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
 
-    # Max drawdown — track equity curve
     max_drawdown = _calculate_max_drawdown(trades, result.initial_capital)
-
-    # Sharpe ratio (simplified, risk-free = 0)
     sharpe_ratio = _calculate_sharpe(trades)
 
     avg_confidence = sum(t.confidence for t in trades) / total
@@ -88,6 +113,44 @@ def calculate_metrics(result: BacktestResult) -> Metrics:
     duration: timedelta = result.end_date - result.start_date
     duration_weeks = duration.total_seconds() / SECONDS_PER_WEEK
     trades_per_week = total / duration_weeks if duration_weeks > 0 else 0.0
+
+    # Fee breakdown
+    total_position_vol = sum(t.position_size_usd for t in trades)
+    avg_fee_pct = (total_fees / (total_position_vol * 2)) if total_position_vol > 0 else 0.0
+    fee_tier_breakdown = dict(Counter(t.fee_tier for t in trades))
+
+    # Cost breakdown
+    total_slippage = sum(t.slippage_paid for t in trades)
+    total_spread_cost = sum(t.spread_cost for t in trades)
+    gap_stops = sum(1 for t in trades if t.gap_stop)
+
+    # Performance by hour
+    performance_by_hour = _performance_by_group(trades, lambda t: t.entry_hour)
+    performance_by_day = _performance_by_group(trades, lambda t: t.entry_day)
+
+    # Regime analysis
+    trades_by_regime = dict(Counter(t.regime for t in trades))
+    win_rate_by_regime = {}
+    pf_by_regime = {}
+    for regime in trades_by_regime:
+        r_trades = [t for t in trades if t.regime == regime]
+        r_wins = [t for t in r_trades if t.outcome == "WIN"]
+        r_losses = [t for t in r_trades if t.outcome == "LOSS"]
+        win_rate_by_regime[regime] = len(r_wins) / len(r_trades) if r_trades else 0.0
+        g_wins = sum(t.pnl for t in r_wins) if r_wins else 0.0
+        g_losses = abs(sum(t.pnl for t in r_losses)) if r_losses else 0.0
+        pf_by_regime[regime] = g_wins / g_losses if g_losses > 0 else float("inf")
+
+    # Buy-and-hold benchmark
+    bh_return_pct = 0.0
+    bh_max_drawdown = 0.0
+    bh_sharpe = 0.0
+    alpha_vs_bh = 0.0
+    if result.buy_and_hold:
+        bh_return_pct = result.buy_and_hold.return_pct
+        bh_max_drawdown = result.buy_and_hold.max_drawdown
+        bh_sharpe = result.buy_and_hold.sharpe
+        alpha_vs_bh = total_pnl_pct - bh_return_pct
 
     return Metrics(
         total_trades=total,
@@ -106,7 +169,40 @@ def calculate_metrics(result: BacktestResult) -> Metrics:
         best_trade=best_trade,
         worst_trade=worst_trade,
         trades_per_week=trades_per_week,
+        avg_fee_pct=avg_fee_pct,
+        fee_tier_breakdown=fee_tier_breakdown,
+        total_slippage=total_slippage,
+        total_spread_cost=total_spread_cost,
+        gap_stops=gap_stops,
+        performance_by_hour=performance_by_hour,
+        performance_by_day=performance_by_day,
+        trades_by_regime=trades_by_regime,
+        win_rate_by_regime=win_rate_by_regime,
+        pf_by_regime=pf_by_regime,
+        bh_return_pct=bh_return_pct,
+        bh_max_drawdown=bh_max_drawdown,
+        bh_sharpe=bh_sharpe,
+        alpha_vs_bh=alpha_vs_bh,
     )
+
+
+def _performance_by_group(trades: list[TradeResult], key_fn) -> dict:
+    """Compute win rate and trade count grouped by a key function."""
+    groups: dict = {}
+    for t in trades:
+        k = key_fn(t)
+        if k not in groups:
+            groups[k] = {"trades": 0, "wins": 0}
+        groups[k]["trades"] += 1
+        if t.outcome == "WIN":
+            groups[k]["wins"] += 1
+    result = {}
+    for k, v in groups.items():
+        result[k] = {
+            "trades": v["trades"],
+            "win_rate": v["wins"] / v["trades"] if v["trades"] else 0.0,
+        }
+    return result
 
 
 def _calculate_max_drawdown(trades: list[TradeResult], initial_capital: float) -> float:
@@ -123,7 +219,7 @@ def _calculate_max_drawdown(trades: list[TradeResult], initial_capital: float) -
         if drawdown > max_dd:
             max_dd = drawdown
 
-    return max_dd * 100.0  # as percentage
+    return max_dd * 100.0
 
 
 def _calculate_sharpe(trades: list[TradeResult]) -> float:
@@ -134,7 +230,7 @@ def _calculate_sharpe(trades: list[TradeResult]) -> float:
     returns = [t.pnl_pct for t in trades]
     mean_ret = sum(returns) / len(returns)
     variance = sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)
-    std_ret = math.sqrt(variance)
+    std_ret = math.sqrt(variance) if variance > 0 else 0.0
 
     if std_ret == 0.0:
         return 0.0
