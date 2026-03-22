@@ -2,7 +2,7 @@
 
 Starts all data feeds concurrently:
   - Coinbase WebSocket (real-time BTC-USD candles)
-  - CryptoPanic headline poller (every 15 minutes)
+  - Crypto news headline poller (every 15 minutes)
   - Fear & Greed Index poller (every 15 minutes)
 
 Usage:
@@ -19,7 +19,7 @@ from pathlib import Path
 from config import config
 from database.db import close_db, get_table_count, init_db, insert_system_log
 from feeds.coinbase_ws import run_coinbase_ws
-from feeds.news import run_cryptopanic_poller, run_fear_greed_poller
+from feeds.news import run_fear_greed_poller, run_news_poller
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,7 +90,7 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(run_coinbase_ws(), name="coinbase_ws"),
-        asyncio.create_task(run_cryptopanic_poller(), name="cryptopanic"),
+        asyncio.create_task(run_news_poller(), name="crypto_news"),
         asyncio.create_task(run_fear_greed_poller(), name="fear_greed"),
     ]
 

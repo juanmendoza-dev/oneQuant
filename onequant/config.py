@@ -11,7 +11,6 @@ load_dotenv()
 REQUIRED_VARS: list[str] = [
     "COINBASE_API_KEY",
     "COINBASE_API_SECRET",
-    "CRYPTOPANIC_API_KEY",
 ]
 
 
@@ -21,7 +20,6 @@ class Config:
 
     COINBASE_API_KEY: str
     COINBASE_API_SECRET: str
-    CRYPTOPANIC_API_KEY: str
     DATABASE_PATH: str
     LOG_LEVEL: str
 
@@ -41,7 +39,6 @@ def load_config() -> Config:
     return Config(
         COINBASE_API_KEY=os.environ["COINBASE_API_KEY"],
         COINBASE_API_SECRET=os.environ["COINBASE_API_SECRET"],
-        CRYPTOPANIC_API_KEY=os.environ["CRYPTOPANIC_API_KEY"],
         DATABASE_PATH=os.getenv("DATABASE_PATH", "./onequant.db"),
         LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO"),
     )

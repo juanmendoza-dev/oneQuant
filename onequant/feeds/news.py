@@ -1,15 +1,15 @@
-"""CryptoPanic headline poller and Fear & Greed Index poller.
+"""Crypto news headline poller and Fear & Greed Index poller.
 
 Two independent async loops, each running on a 15-minute interval:
-  - CryptoPanic: fetches BTC-related news headlines with sentiment
+  - free-crypto-news (cryptocurrency.cv): fetches BTC-related headlines
   - Fear & Greed Index: fetches the current score and label
 """
 
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import aiohttp
 
@@ -24,7 +24,7 @@ MODULE_NAME: str = "news"
 POLL_INTERVAL: int = 900  # 15 minutes in seconds
 ERROR_RETRY_DELAY: int = 30
 
-CRYPTOPANIC_URL: str = "https://cryptopanic.com/api/v1/posts/"
+CRYPTO_NEWS_URL: str = "https://cryptocurrency.cv/api/news"
 FEAR_GREED_URL: str = "https://api.alternative.me/fng/"
 
 # ---------------------------------------------------------------------------
@@ -55,91 +55,62 @@ def _setup_logging() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sentiment helper
+# Crypto news poller (cryptocurrency.cv)
 # ---------------------------------------------------------------------------
 
-VOTE_SENTIMENT_MAP: dict[str, str] = {
-    "positive": "positive",
-    "negative": "negative",
-    "important": "positive",
-    "liked": "positive",
-    "disliked": "negative",
-    "lol": "neutral",
-    "toxic": "negative",
-    "saved": "neutral",
-}
+NEWS_FETCH_LIMIT: int = 20
 
 
-def _derive_sentiment(votes: dict[str, Any]) -> str:
-    """Derive overall sentiment from CryptoPanic vote data."""
-    if not votes:
-        return "neutral"
-    pos = sum(int(votes.get(k, 0)) for k in ("positive", "important", "liked"))
-    neg = sum(int(votes.get(k, 0)) for k in ("negative", "disliked", "toxic"))
-    if pos > neg:
-        return "positive"
-    if neg > pos:
-        return "negative"
-    return "neutral"
-
-
-# ---------------------------------------------------------------------------
-# CryptoPanic poller
-# ---------------------------------------------------------------------------
-
-
-async def _poll_cryptopanic() -> None:
-    """Fetch latest BTC headlines from CryptoPanic and store new ones."""
+async def _poll_crypto_news() -> None:
+    """Fetch latest BTC headlines from cryptocurrency.cv and store new ones."""
     params = {
-        "auth_token": config.CRYPTOPANIC_API_KEY,
-        "currencies": "BTC",
-        "kind": "news",
+        "ticker": "BTC",
+        "limit": str(NEWS_FETCH_LIMIT),
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(CRYPTOPANIC_URL, params=params) as resp:
+            async with session.get(CRYPTO_NEWS_URL, params=params) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    logger.error("CryptoPanic API %s: %s", resp.status, text)
+                    logger.error("crypto-news API %s: %s", resp.status, text)
                     return
                 data = await resp.json()
     except Exception as exc:
-        msg = f"CryptoPanic request failed: {exc}"
+        msg = f"crypto-news request failed: {exc}"
         logger.error(msg)
         await insert_system_log(MODULE_NAME, "ERROR", msg)
         return
 
-    results = data.get("results", [])
+    articles = data.get("articles", [])
     inserted = 0
-    for post in results:
-        url = post.get("url", "")
-        if not url:
+    for article in articles:
+        link = article.get("link", "")
+        if not link:
             continue
-        if await news_url_exists(url):
+        if await news_url_exists(link):
             continue
 
-        headline = post.get("title", "")
-        pub_ts = int(time.time())  # use current time as fallback
-        if post.get("published_at"):
+        headline = article.get("title", "")
+        pub_ts = int(time.time())
+        if article.get("pubDate"):
             try:
-                from datetime import datetime, timezone
-
-                dt = datetime.fromisoformat(post["published_at"].replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(
+                    article["pubDate"].replace("Z", "+00:00")
+                )
                 pub_ts = int(dt.timestamp())
             except (ValueError, TypeError):
                 pass
 
-        votes = post.get("votes", {})
-        sentiment = _derive_sentiment(votes)
+        sentiment = "neutral"
+        currencies = "BTC"
 
-        currencies_list = [c.get("code", "") for c in post.get("currencies", [])]
-        currencies = ",".join(filter(None, currencies_list)) or "BTC"
-
-        await insert_news(pub_ts, "cryptopanic", headline, url, sentiment, currencies)
+        await insert_news(
+            pub_ts, "cryptocurrency.cv", headline, link, sentiment, currencies
+        )
         inserted += 1
 
     if inserted:
-        logger.info("CryptoPanic: inserted %d new headlines", inserted)
+        logger.info("crypto-news: inserted %d new headlines", inserted)
 
 
 # ---------------------------------------------------------------------------
@@ -181,18 +152,18 @@ async def _poll_fear_greed() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_cryptopanic_poller() -> None:
-    """Poll CryptoPanic every 15 minutes. Never raises."""
+async def run_news_poller() -> None:
+    """Poll cryptocurrency.cv every 15 minutes. Never raises."""
     _setup_logging()
-    logger.info("CryptoPanic poller started (interval=%ds)", POLL_INTERVAL)
+    logger.info("crypto-news poller started (interval=%ds)", POLL_INTERVAL)
     while True:
         try:
-            await _poll_cryptopanic()
+            await _poll_crypto_news()
         except asyncio.CancelledError:
-            logger.info("CryptoPanic poller cancelled")
+            logger.info("crypto-news poller cancelled")
             return
         except Exception as exc:
-            msg = f"CryptoPanic poller error: {exc}"
+            msg = f"crypto-news poller error: {exc}"
             logger.error(msg)
             try:
                 await insert_system_log(MODULE_NAME, "ERROR", msg)
