@@ -1,115 +1,216 @@
-import sqlite3
-import threading
-from config import DATABASE_PATH
+"""SQLite database setup, table creation, and insert helpers."""
 
-_local = threading.local()
+import time
+from pathlib import Path
+from typing import Optional
+
+import aiosqlite
+
+from config import config
+
+# ---------------------------------------------------------------------------
+# Table definitions
+# ---------------------------------------------------------------------------
+
+CREATE_BTC_CANDLES: str = """
+CREATE TABLE IF NOT EXISTS btc_candles (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    timeframe TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume REAL NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(timestamp, timeframe)
+)"""
+
+CREATE_NEWS_FEED: str = """
+CREATE TABLE IF NOT EXISTS news_feed (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    url TEXT NOT NULL,
+    sentiment TEXT NOT NULL,
+    currencies TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)"""
+
+CREATE_FEAR_GREED: str = """
+CREATE TABLE IF NOT EXISTS fear_greed (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    score INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)"""
+
+CREATE_SYSTEM_LOG: str = """
+CREATE TABLE IF NOT EXISTS system_log (
+    id INTEGER PRIMARY KEY,
+    timestamp INTEGER NOT NULL,
+    module TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL
+)"""
+
+CREATE_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_candles_ts ON btc_candles(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_candles_tf ON btc_candles(timeframe)",
+    "CREATE INDEX IF NOT EXISTS idx_news_ts ON news_feed(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_news_url ON news_feed(url)",
+    "CREATE INDEX IF NOT EXISTS idx_fg_ts ON fear_greed(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_syslog_ts ON system_log(timestamp)",
+]
+
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
+
+_conn: Optional[aiosqlite.Connection] = None
 
 
-def get_connection() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(DATABASE_PATH)
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA busy_timeout=5000")
-    return _local.conn
+async def init_db() -> None:
+    """Open the database connection and create all tables and indexes."""
+    global _conn
+    db_path = Path(config.DATABASE_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    _conn = await aiosqlite.connect(str(db_path))
+    await _conn.execute("PRAGMA journal_mode=WAL")
+    await _conn.execute(CREATE_BTC_CANDLES)
+    await _conn.execute(CREATE_NEWS_FEED)
+    await _conn.execute(CREATE_FEAR_GREED)
+    await _conn.execute(CREATE_SYSTEM_LOG)
+    for idx_sql in CREATE_INDEXES:
+        await _conn.execute(idx_sql)
+    await _conn.commit()
 
 
-def init_db():
-    conn = get_connection()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS btc_candles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER NOT NULL,
-            open REAL NOT NULL,
-            high REAL NOT NULL,
-            low REAL NOT NULL,
-            close REAL NOT NULL,
-            volume REAL NOT NULL,
-            timeframe TEXT NOT NULL,
-            UNIQUE(timestamp, timeframe)
-        );
-
-        CREATE TABLE IF NOT EXISTS kalshi_markets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER NOT NULL,
-            market_id TEXT NOT NULL,
-            market_title TEXT NOT NULL,
-            yes_price REAL NOT NULL,
-            no_price REAL NOT NULL,
-            spread REAL NOT NULL,
-            volume INTEGER NOT NULL,
-            expiry TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS news_feed (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER NOT NULL,
-            source TEXT NOT NULL,
-            headline TEXT NOT NULL,
-            url TEXT NOT NULL,
-            sentiment_score REAL,
-            currencies TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS fear_greed (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER NOT NULL,
-            score INTEGER NOT NULL,
-            label TEXT NOT NULL,
-            UNIQUE(timestamp)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_candles_ts ON btc_candles(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_candles_tf ON btc_candles(timeframe);
-        CREATE INDEX IF NOT EXISTS idx_kalshi_ts ON kalshi_markets(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_news_ts ON news_feed(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_fg_ts ON fear_greed(timestamp);
-    """)
-    conn.commit()
+async def close_db() -> None:
+    """Close the database connection."""
+    global _conn
+    if _conn:
+        await _conn.close()
+        _conn = None
 
 
-def insert_candle(timestamp: int, o: float, h: float, l: float, c: float,
-                  volume: float, timeframe: str):
-    conn = get_connection()
-    conn.execute(
-        "INSERT OR IGNORE INTO btc_candles "
-        "(timestamp, open, high, low, close, volume, timeframe) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (timestamp, o, h, l, c, volume, timeframe),
+def _get_conn() -> aiosqlite.Connection:
+    """Return the active database connection or raise if not initialized."""
+    if _conn is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    return _conn
+
+
+# ---------------------------------------------------------------------------
+# Insert helpers
+# ---------------------------------------------------------------------------
+
+
+async def insert_candle(
+    timestamp: int,
+    timeframe: str,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+) -> None:
+    """Insert a completed candle into btc_candles. Skips duplicates."""
+    conn = _get_conn()
+    await conn.execute(
+        """INSERT OR IGNORE INTO btc_candles
+           (timestamp, timeframe, open, high, low, close, volume, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (timestamp, timeframe, open_, high, low, close, volume, int(time.time())),
     )
-    conn.commit()
+    await conn.commit()
 
 
-def insert_kalshi_market(timestamp: int, market_id: str, market_title: str,
-                         yes_price: float, no_price: float, spread: float,
-                         volume: int, expiry: str):
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO kalshi_markets "
-        "(timestamp, market_id, market_title, yes_price, no_price, spread, volume, expiry) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (timestamp, market_id, market_title, yes_price, no_price, spread,
-         volume, expiry),
+async def insert_candles_bulk(
+    rows: list[tuple[int, str, float, float, float, float, float]],
+) -> int:
+    """Bulk-insert candles. Returns number of rows actually inserted."""
+    conn = _get_conn()
+    cursor = await conn.executemany(
+        """INSERT OR IGNORE INTO btc_candles
+           (timestamp, timeframe, open, high, low, close, volume, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(ts, tf, o, h, l, c, v, int(time.time())) for ts, tf, o, h, l, c, v in rows],
     )
-    conn.commit()
+    await conn.commit()
+    return cursor.rowcount
 
 
-def insert_news(timestamp: int, source: str, headline: str, url: str,
-                sentiment_score: float | None, currencies: str | None):
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO news_feed "
-        "(timestamp, source, headline, url, sentiment_score, currencies) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (timestamp, source, headline, url, sentiment_score, currencies),
+async def insert_news(
+    timestamp: int,
+    source: str,
+    headline: str,
+    url: str,
+    sentiment: str,
+    currencies: str,
+) -> None:
+    """Insert a news headline into news_feed."""
+    conn = _get_conn()
+    await conn.execute(
+        """INSERT INTO news_feed
+           (timestamp, source, headline, url, sentiment, currencies, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (timestamp, source, headline, url, sentiment, currencies, int(time.time())),
     )
-    conn.commit()
+    await conn.commit()
 
 
-def insert_fear_greed(timestamp: int, score: int, label: str):
-    conn = get_connection()
-    conn.execute(
-        "INSERT OR IGNORE INTO fear_greed (timestamp, score, label) "
-        "VALUES (?, ?, ?)",
-        (timestamp, score, label),
+async def news_url_exists(url: str) -> bool:
+    """Check if a news URL already exists in the database."""
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT 1 FROM news_feed WHERE url = ? LIMIT 1", (url,)
     )
-    conn.commit()
+    row = await cursor.fetchone()
+    return row is not None
+
+
+async def insert_fear_greed(timestamp: int, score: int, label: str) -> None:
+    """Insert a Fear & Greed Index reading."""
+    conn = _get_conn()
+    await conn.execute(
+        """INSERT INTO fear_greed (timestamp, score, label, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (timestamp, score, label, int(time.time())),
+    )
+    await conn.commit()
+
+
+async def insert_system_log(module: str, level: str, message: str) -> None:
+    """Insert a log entry into system_log table."""
+    conn = _get_conn()
+    await conn.execute(
+        """INSERT INTO system_log (timestamp, module, level, message)
+           VALUES (?, ?, ?, ?)""",
+        (int(time.time()), module, level, message),
+    )
+    await conn.commit()
+
+
+async def get_table_count(table: str) -> int:
+    """Get the row count for a given table."""
+    allowed = {"btc_candles", "news_feed", "fear_greed", "system_log"}
+    if table not in allowed:
+        raise ValueError(f"Unknown table: {table}")
+    conn = _get_conn()
+    cursor = await conn.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
+    row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+async def candle_exists(timestamp: int, timeframe: str) -> bool:
+    """Check if a candle already exists for the given timestamp and timeframe."""
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT 1 FROM btc_candles WHERE timestamp = ? AND timeframe = ? LIMIT 1",
+        (timestamp, timeframe),
+    )
+    row = await cursor.fetchone()
+    return row is not None
