@@ -25,6 +25,7 @@ class NewsDrivenStrategy(BaseStrategy):
 
     name: str = "News Driven"
     timeframe: str = "15m"
+    required_candles: int = REQUIRED_CANDLES
 
     def _query_news(self, since_ts: int) -> dict[str, int]:
         """Count positive and negative headlines since the given timestamp."""

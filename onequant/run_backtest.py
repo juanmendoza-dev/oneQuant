@@ -21,20 +21,35 @@ def main() -> None:
     print("oneQuant v0.2 — Backtest Runner")
     print("=" * 50)
 
-    strategies = [
-        MomentumStrategy(),
-        MeanReversionStrategy(),
-        NewsDrivenStrategy(),
+    configs = [
+        BacktestConfig(
+            strategy=MomentumStrategy(),
+            timeframe=TIMEFRAME,
+            min_confidence=0.70,
+            take_profit_pct=0.04,
+            stop_loss_pct=0.05,
+            fee_pct=0.004,
+        ),
+        BacktestConfig(
+            strategy=MeanReversionStrategy(),
+            timeframe=TIMEFRAME,
+            take_profit_pct=0.03,
+            stop_loss_pct=0.06,
+            fee_pct=0.004,
+        ),
+        BacktestConfig(
+            strategy=NewsDrivenStrategy(),
+            timeframe=TIMEFRAME,
+        ),
     ]
 
     comparison: list[tuple[str, Metrics]] = []
 
-    for strategy in strategies:
-        print(f"\nRunning backtest: {strategy.name} ...")
-        cfg = BacktestConfig(strategy=strategy, timeframe=TIMEFRAME)
+    for cfg in configs:
+        print(f"\nRunning backtest: {cfg.strategy.name} ...")
         result = run_backtest(cfg)
         metrics = print_report(result)
-        comparison.append((strategy.name, metrics))
+        comparison.append((cfg.strategy.name, metrics))
 
     print_comparison(comparison)
 

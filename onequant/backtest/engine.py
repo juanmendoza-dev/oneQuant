@@ -166,7 +166,7 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
 
     # Determine how many candles the strategy needs
     # Walk from the earliest point where we have enough history
-    min_window = max(getattr(strategy, "_required_candles", 22), 3)
+    min_window = max(getattr(strategy, "required_candles", 22), 3)
 
     for i in range(min_window, len(candles)):
         candle = candles[i]

@@ -28,6 +28,7 @@ class BaseStrategy(ABC):
 
     name: str = ""
     timeframe: str = "15m"
+    required_candles: int = 22
 
     @abstractmethod
     def generate_signal(self, candles: list[dict]) -> Signal:

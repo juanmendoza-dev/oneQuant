@@ -1,7 +1,8 @@
 """Strategy B — Mean Reversion.
 
 Uses RSI and EMA to detect overbought/oversold conditions and trade
-the expected snap-back. Requires the last 21 candles on the 15m timeframe.
+the expected snap-back. Requires volume confirmation. Needs the last
+21 candles on the 15m timeframe.
 """
 
 from strategies.base import BaseStrategy, Signal
@@ -9,9 +10,10 @@ from strategies.base import BaseStrategy, Signal
 REQUIRED_CANDLES: int = 21
 RSI_PERIOD: int = 14
 EMA_PERIOD: int = 20
-EMA_DEVIATION_PCT: float = 1.5
-RSI_OVERSOLD: float = 30.0
-RSI_OVERBOUGHT: float = 70.0
+EMA_DEVIATION_PCT: float = 3.0
+RSI_OVERSOLD: float = 20.0
+RSI_OVERBOUGHT: float = 80.0
+VOLUME_MA_PERIOD: int = 10
 BASE_CONFIDENCE: float = 0.60
 CONFIDENCE_PER_5_RSI: float = 0.10
 MAX_CONFIDENCE: float = 0.90
@@ -55,17 +57,21 @@ def _calculate_ema(values: list[float], period: int) -> float:
 
 
 class MeanReversionStrategy(BaseStrategy):
-    """Buy on oversold RSI below EMA; sell on overbought RSI above EMA."""
+    """Buy on extreme oversold RSI below EMA; sell on extreme overbought above EMA.
+
+    Requires volume to be above its 10-period average as confirmation.
+    """
 
     name: str = "Mean Reversion"
     timeframe: str = "15m"
+    required_candles: int = REQUIRED_CANDLES
 
     def generate_signal(self, candles: list[dict]) -> Signal:
         """Generate a mean-reversion signal from the last 21 candles.
 
         Logic:
-            - RSI < 30 AND close > 1.5% below 20-EMA → BUY
-            - RSI > 70 AND close > 1.5% above 20-EMA → SELL
+            - RSI < 25 AND close > 2.5% below 20-EMA AND volume above 10-period avg → BUY
+            - RSI > 75 AND close > 2.5% above 20-EMA AND volume above 10-period avg → SELL
             - Confidence starts at 0.60, +0.10 per 5 RSI points beyond
               the threshold (capped at 0.90).
         """
@@ -82,6 +88,14 @@ class MeanReversionStrategy(BaseStrategy):
 
         deviation_pct = ((current_close - ema) / ema) * 100.0
 
+        # Volume confirmation: current volume must exceed 10-period average
+        volumes = [c["volume"] for c in candles[-VOLUME_MA_PERIOD:]]
+        vol_ma = sum(volumes) / VOLUME_MA_PERIOD
+        current_vol = candles[-1]["volume"]
+
+        if vol_ma > 0 and current_vol <= vol_ma:
+            return Signal("SKIP", 0.0, f"Volume {current_vol:.0f} below 10-period avg {vol_ma:.0f}")
+
         if rsi < RSI_OVERSOLD and deviation_pct < -EMA_DEVIATION_PCT:
             points_beyond = RSI_OVERSOLD - rsi
             extra = (points_beyond // 5) * CONFIDENCE_PER_5_RSI
@@ -89,7 +103,7 @@ class MeanReversionStrategy(BaseStrategy):
             return Signal(
                 "BUY",
                 confidence,
-                f"RSI {rsi:.1f} (oversold), price {deviation_pct:.2f}% below EMA",
+                f"RSI {rsi:.1f} (oversold), price {deviation_pct:.2f}% below EMA, vol confirmed",
             )
 
         if rsi > RSI_OVERBOUGHT and deviation_pct > EMA_DEVIATION_PCT:
@@ -99,7 +113,7 @@ class MeanReversionStrategy(BaseStrategy):
             return Signal(
                 "SELL",
                 confidence,
-                f"RSI {rsi:.1f} (overbought), price +{deviation_pct:.2f}% above EMA",
+                f"RSI {rsi:.1f} (overbought), price +{deviation_pct:.2f}% above EMA, vol confirmed",
             )
 
         return Signal("SKIP", 0.0, f"RSI {rsi:.1f}, deviation {deviation_pct:.2f}% — no setup")
