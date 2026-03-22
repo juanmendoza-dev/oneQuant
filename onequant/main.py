@@ -1,49 +1,139 @@
+"""oneQuant v0.1 — data pipeline entry point.
+
+Starts all data feeds concurrently:
+  - Coinbase WebSocket (real-time BTC-USD candles)
+  - CryptoPanic headline poller (every 15 minutes)
+  - Fear & Greed Index poller (every 15 minutes)
+
+Usage:
+    cd onequant/
+    python main.py
+"""
+
 import asyncio
+import logging
 import signal
 import sys
-from database.db import init_db
-from feeds import coinbase, kalshi, news
+from pathlib import Path
+
+from config import config
+from database.db import close_db, get_table_count, init_db, insert_system_log
+from feeds.coinbase_ws import run_coinbase_ws
+from feeds.news import run_cryptopanic_poller, run_fear_greed_poller
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MODULE_NAME: str = "main"
+BANNER: str = "oneQuant v0.1 — data pipeline running"
+TABLES: list[str] = ["btc_candles", "news_feed", "fear_greed", "system_log"]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger: logging.Logger = logging.getLogger(MODULE_NAME)
 
 
-async def main():
-    init_db()
-    print("oneQuant data pipeline started")
-    print("  - Coinbase WebSocket: BTC-USD ticker")
-    print("  - Kalshi poller: every 60s")
-    print("  - News + Fear & Greed: every 15m")
-    print("Press CTRL+C to stop.\n")
+def _setup_logging() -> None:
+    """Configure file and console logging for the main module."""
+    if logger.handlers:
+        return
+    logger.setLevel(logging.DEBUG)
+    Path("logs").mkdir(exist_ok=True)
+
+    fh = logging.FileHandler("logs/main.log")
+    fh.setLevel(logging.DEBUG)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
+    fh.setFormatter(fmt)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+
+# ---------------------------------------------------------------------------
+# Startup helpers
+# ---------------------------------------------------------------------------
+
+
+async def _print_table_counts() -> None:
+    """Print the current row count for every tracked table."""
+    print("\nDatabase row counts:")
+    for table in TABLES:
+        count = await get_table_count(table)
+        print(f"  {table}: {count:,}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+async def main() -> None:
+    """Initialize the database and run all feeds concurrently."""
+    _setup_logging()
+
+    print(BANNER)
+    print("=" * len(BANNER))
+
+    await init_db()
+    await _print_table_counts()
+
+    logger.info("Starting all data feeds")
+    await insert_system_log(MODULE_NAME, "INFO", "Data pipeline started")
 
     tasks = [
-        asyncio.create_task(coinbase.run(), name="coinbase"),
-        asyncio.create_task(kalshi.run(), name="kalshi"),
-        asyncio.create_task(news.run(), name="news"),
+        asyncio.create_task(run_coinbase_ws(), name="coinbase_ws"),
+        asyncio.create_task(run_cryptopanic_poller(), name="cryptopanic"),
+        asyncio.create_task(run_fear_greed_poller(), name="fear_greed"),
     ]
 
+    # Graceful shutdown on SIGINT / SIGTERM
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler() -> None:
+        logger.info("Shutdown signal received")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            # Windows does not support add_signal_handler for SIGTERM
+            pass
+
     try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        pass
+        # On Windows, KeyboardInterrupt will be raised directly
+        done, pending = await asyncio.wait(
+            [asyncio.create_task(shutdown_event.wait()), *tasks],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received — shutting down")
+    finally:
+        # Cancel all feed tasks
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-
-def shutdown(loop: asyncio.AbstractEventLoop):
-    print("\nShutting down...")
-    for task in asyncio.all_tasks(loop):
-        task.cancel()
+        await insert_system_log(MODULE_NAME, "INFO", "Data pipeline stopped")
+        await close_db()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    if sys.platform != "win32":
-        loop.add_signal_handler(signal.SIGINT, lambda: shutdown(loop))
-        loop.add_signal_handler(signal.SIGTERM, lambda: shutdown(loop))
-
     try:
-        loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        shutdown(loop)
-        loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True))
-    finally:
-        loop.close()
-        print("oneQuant stopped.")
+        print("\nShutdown complete")
+    except Exception as exc:
+        # Last-resort logging for truly unhandled exceptions
+        logging.getLogger(MODULE_NAME).critical("Unhandled exception: %s", exc)
+        sys.exit(1)
