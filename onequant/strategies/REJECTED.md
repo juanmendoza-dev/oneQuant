@@ -58,3 +58,55 @@ thresholds, eliminating statistical significance.
 
 Strategy is kept in `breakout.py` for reference but should not be
 included in production backtests or live trading.
+
+---
+
+## VWAP Momentum
+
+**File:** `strategies/vwap_momentum.py`
+**Tested:** 2026-03-25
+**Verdict:** REJECTED — negative EV before costs
+
+### Results ($250 capital, 10 years 15m data)
+
+| Config | Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|---|
+| No regime filter | 1,303 | 38.1% | 0.48 | -70.1% | -$175.18 |
+
+### Why it fails
+
+Win rate of 38% with a 2% stop loss / 3% take profit is negative EV
+before costs are even applied:
+
+```
+Expected value = (WR × TP) - ((1 - WR) × SL)
+               = (0.38 × 3%) - (0.62 × 2%)
+               = 1.14% - 1.24%
+               = -0.10% per trade (gross)
+
+After fees (0.4% round-trip) + slippage (0.1%) + spread (0.05%):
+Net EV = -0.10% - 0.55% = -0.65% per trade
+```
+
+### Root cause
+
+By the time all 4 conditions align simultaneously (VWAP deviation,
+2x volume surge, 3 consecutive directional candles, RSI in range),
+the move is already overextended. Volume surges on 15m BTC-USD candles
+mark local extremes — capitulation lows and blow-off tops — not the
+start of sustained moves. The signal fires into reversals.
+
+### What was tried
+
+- No regime filter: WR 38%, PF 0.48
+
+Regime breakdown shows BEAR_TREND at 60% WR / PF 1.20, but only
+15 trades over 10 years — insufficient sample size, likely noise.
+
+### Not worth pursuing
+
+No parameter variation can fix negative EV math. The 2x volume
+requirement is the structural flaw — it selects for exhaustion candles
+not momentum candles. Strategy is kept in `vwap_momentum.py` for
+reference but should not be included in production backtests or live
+trading.
