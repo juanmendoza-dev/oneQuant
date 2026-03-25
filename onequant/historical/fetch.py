@@ -1,8 +1,9 @@
 """Coinbase Advanced Trade historical OHLCV candle fetcher.
 
-Fetches BTC-USD candles for 5m, 15m, and 1h timeframes going back up to
-2 years. Paginates through the Coinbase API (max 300 candles per request),
-skips timestamps already in the database, and displays a progress bar.
+Fetches BTC-USD candles for 5m, 15m, and 1h timeframes going back to
+2016-01-01 (maximum useful Coinbase history). Paginates through the
+Coinbase API (max 300 candles per request), skips timestamps already
+in the database, and displays a progress bar.
 
 Usage:
     cd onequant/
@@ -45,7 +46,8 @@ TIMEFRAME_MAP: dict[str, tuple[str, int]] = {
 }
 
 SECONDS_PER_YEAR: int = 365 * 24 * 3600
-TARGET_LOOKBACK: int = 2 * SECONDS_PER_YEAR  # 2 years
+# 2016-01-01 00:00:00 UTC — maximum useful Coinbase BTC-USD history
+EARLIEST_TIMESTAMP: int = 1451606400
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -125,7 +127,7 @@ async def _fetch_candles_page(
 async def _fetch_timeframe(tf_label: str, granularity: str, interval: int) -> int:
     """Fetch all historical candles for a single timeframe. Returns insert count."""
     now = int(time.time())
-    earliest = now - TARGET_LOOKBACK
+    earliest = EARLIEST_TIMESTAMP
     page_span = CANDLES_PER_REQUEST * interval
 
     # Calculate total pages for progress bar
@@ -191,7 +193,8 @@ async def run_historical_fetch() -> None:
     print("=" * 60)
     print("oneQuant — Historical OHLCV Fetcher")
     print(f"Product: {PRODUCT_ID}")
-    print(f"Target lookback: {TARGET_LOOKBACK // SECONDS_PER_YEAR} years")
+    years = (int(time.time()) - EARLIEST_TIMESTAMP) / SECONDS_PER_YEAR
+    print(f"Target lookback: {years:.1f} years (back to 2016-01-01)")
     print("=" * 60)
 
     grand_total = 0
