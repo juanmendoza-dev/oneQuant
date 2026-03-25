@@ -1,7 +1,8 @@
 """Parameter sweep targeting TRADE FREQUENCY for Mean Reversion.
 
-Tests RSI oversold × EMA deviation combinations, ranks by
-profit_factor × log(trade_count) to reward both quality and quantity.
+Tests RSI oversold x EMA deviation x stop loss x take profit with
+regime filter (BULL_TREND + BEAR_TREND only). Filters for combinations
+with 80+ trades, PF >= 1.2, WR >= 60%, max drawdown > -15%.
 
 Usage:
     cd onequant/
@@ -103,11 +104,15 @@ class TuneableMeanReversion(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
-# Sweep
+# Sweep parameters
 # ---------------------------------------------------------------------------
 
-RSI_OVERSOLD_VALUES = [24, 26, 28, 30, 32]
-EMA_DEVIATION_VALUES = [1.5, 2.0, 2.5, 3.0]
+RSI_OVERSOLD_VALUES = [25, 28, 30, 32, 35]
+EMA_DEVIATION_VALUES = [1.0, 1.5, 2.0, 2.5]
+STOP_LOSS_VALUES = [0.04, 0.05, 0.06]
+TAKE_PROFIT_VALUES = [0.02, 0.03, 0.04]
+
+REGIME_FILTER = ["BULL_TREND", "BEAR_TREND"]
 
 
 @dataclass
@@ -115,16 +120,34 @@ class SweepResult:
     rsi_os: float
     rsi_ob: float
     ema_dev: float
+    stop_loss: float
+    take_profit: float
     trades: int
     win_rate: float
     profit_factor: float
+    max_drawdown: float
     total_pnl: float
-    score: float  # PF * log(trade_count)
+
+
+def _max_drawdown(trades: list) -> float:
+    """Compute max drawdown percentage from a list of TradeResult objects."""
+    if not trades:
+        return 0.0
+    equity = trades[0].equity_before
+    peak = equity
+    max_dd = 0.0
+    for t in trades:
+        equity = t.equity_after
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+    return max_dd * 100.0
 
 
 def run_sweep() -> list[SweepResult]:
-    """Run the full parameter sweep and return sorted results."""
-    # Verify data exists
+    """Run the full parameter sweep and return results."""
     conn = sqlite3.connect(config.DATABASE_PATH)
     row = conn.execute(
         "SELECT COUNT(*) FROM btc_candles WHERE timeframe = '15m'"
@@ -136,16 +159,20 @@ def run_sweep() -> list[SweepResult]:
         print("  ERROR: Not enough candle data. Run historical.fetch first.")
         return []
 
-    results: list[SweepResult] = []
-    combos = [(os_val, ema_val)
-              for os_val in RSI_OVERSOLD_VALUES
-              for ema_val in EMA_DEVIATION_VALUES]
+    combos = [
+        (rsi_os, ema_dev, sl, tp)
+        for rsi_os in RSI_OVERSOLD_VALUES
+        for ema_dev in EMA_DEVIATION_VALUES
+        for sl in STOP_LOSS_VALUES
+        for tp in TAKE_PROFIT_VALUES
+    ]
     total = len(combos)
+    print(f"  Testing {total} combinations (regime: BULL_TREND + BEAR_TREND)...\n")
 
-    print(f"  Testing {total} combinations...\n")
+    results: list[SweepResult] = []
 
-    for idx, (rsi_os, ema_dev) in enumerate(combos, 1):
-        rsi_ob = 100.0 - rsi_os  # symmetric: oversold 24 → overbought 76
+    for idx, (rsi_os, ema_dev, sl, tp) in enumerate(combos, 1):
+        rsi_ob = 100.0 - rsi_os
 
         strategy = TuneableMeanReversion(
             rsi_oversold=rsi_os,
@@ -157,93 +184,100 @@ def run_sweep() -> list[SweepResult]:
             timeframe="15m",
             initial_capital=25.0,
             position_size_pct=0.10,
-            stop_loss_pct=0.02,
-            take_profit_pct=0.03,
+            stop_loss_pct=sl,
+            take_profit_pct=tp,
             min_confidence=0.55,
             slippage_pct=0.001,
             spread_pct=0.0005,
+            order_type="limit",
+            allowed_regimes=REGIME_FILTER,
         )
 
         try:
             result = run_backtest(cfg)
         except RuntimeError as e:
-            print(f"  [{idx:2d}/{total}] RSI {rsi_os}/{rsi_ob} EMA {ema_dev}% — ERROR: {e}")
+            print(f"  [{idx:3d}/{total}] ERROR: {e}")
             continue
 
         trades = result.trades
         n = len(trades)
         wins = sum(1 for t in trades if t.outcome == "WIN")
-        losses_list = [t for t in trades if t.outcome == "LOSS"]
         wr = wins / n if n else 0.0
 
         gross_win = sum(t.pnl for t in trades if t.pnl > 0)
         gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
         pf = gross_win / gross_loss if gross_loss > 0 else 0.0
         total_pnl = sum(t.pnl for t in trades)
-
-        score = pf * math.log(n) if n > 1 and pf > 0 else 0.0
+        max_dd = _max_drawdown(trades)
 
         results.append(SweepResult(
             rsi_os=rsi_os,
             rsi_ob=rsi_ob,
             ema_dev=ema_dev,
+            stop_loss=sl,
+            take_profit=tp,
             trades=n,
             win_rate=wr,
             profit_factor=pf,
+            max_drawdown=max_dd,
             total_pnl=total_pnl,
-            score=score,
         ))
 
-        tag = ""
-        if n >= 100 and wr > 0.60 and pf > 1.0:
-            tag = " <-- CANDIDATE"
-        print(f"  [{idx:2d}/{total}] RSI {rsi_os}/{rsi_ob:.0f}  EMA {ema_dev}%  "
-              f"n={n:4d}  WR={wr*100:5.1f}%  PF={pf:.3f}  "
-              f"P&L=${total_pnl:+.2f}{tag}")
+        if idx % 20 == 0 or idx == total:
+            print(f"  [{idx:3d}/{total}] completed...")
 
     return results
 
 
 def print_top_results(results: list[SweepResult]) -> None:
-    """Print the top 10 combinations sorted by score."""
-    # Sort by score descending
-    ranked = sorted(results, key=lambda r: r.score, reverse=True)
-    top = ranked[:10]
+    """Filter and print the top 15 results sorted by profit factor."""
+    filtered = [
+        r for r in results
+        if r.trades >= 80
+        and r.profit_factor >= 1.2
+        and r.win_rate >= 0.60
+        and r.max_drawdown < 15.0
+    ]
 
-    print("\n" + "=" * 75)
-    print("  Top 10 by PF * log(trade_count)")
-    print("=" * 75)
-    print(f"  {'#':>2}  {'RSI_OS':>6} {'RSI_OB':>6} {'EMA%':>5}  "
-          f"{'Trades':>6} {'WR%':>6} {'PF':>6} {'P&L':>9} {'Score':>7}")
-    print("  " + "-" * 71)
+    ranked = sorted(filtered, key=lambda r: r.profit_factor, reverse=True)
+    top = ranked[:15]
+
+    print("\n" + "=" * 95)
+    print("  Top 15 — filtered: trades>=80, PF>=1.2, WR>=60%, MaxDD<15%")
+    print("  Regime: BULL_TREND + BEAR_TREND only")
+    print("=" * 95)
+    print(f"  {'#':>2}  {'RSI_OS':>6} {'EMA%':>5} {'SL%':>5} {'TP%':>5}  "
+          f"{'Trades':>6} {'WR%':>6} {'PF':>6} {'MaxDD%':>7} {'P&L':>9}")
+    print("  " + "-" * 89)
+
+    if not top:
+        print("  No combinations met all filter criteria.")
+        print(f"\n  Total tested: {len(results)}")
+        # Show how many met partial criteria
+        t80 = sum(1 for r in results if r.trades >= 80)
+        pf12 = sum(1 for r in results if r.profit_factor >= 1.2)
+        wr60 = sum(1 for r in results if r.win_rate >= 0.60)
+        dd15 = sum(1 for r in results if r.max_drawdown < 15.0)
+        print(f"  trades>=80: {t80}  |  PF>=1.2: {pf12}  |  WR>=60%: {wr60}  |  MaxDD<15%: {dd15}")
+        return
 
     for i, r in enumerate(top, 1):
-        flag = ""
-        if r.trades >= 100 and r.win_rate > 0.60 and r.profit_factor > 1.0:
-            flag = " *"
-        print(f"  {i:2d}  {r.rsi_os:6.0f} {r.rsi_ob:6.0f} {r.ema_dev:5.1f}  "
+        print(f"  {i:2d}  {r.rsi_os:6.0f} {r.ema_dev:5.1f} {r.stop_loss*100:5.1f} {r.take_profit*100:5.1f}  "
               f"{r.trades:6d} {r.win_rate*100:5.1f}% {r.profit_factor:6.3f} "
-              f"${r.total_pnl:+8.2f} {r.score:7.3f}{flag}")
+              f"{r.max_drawdown:6.1f}% ${r.total_pnl:+8.2f}")
 
-    # Summarize candidates
-    candidates = [r for r in results
-                  if r.trades >= 100 and r.win_rate > 0.60 and r.profit_factor > 1.0]
-    print(f"\n  Candidates (100+ trades, WR>60%, PF>1.0): {len(candidates)}")
-    if candidates:
-        best = max(candidates, key=lambda r: r.score)
-        print(f"  Best candidate: RSI {best.rsi_os}/{best.rsi_ob:.0f}, "
-              f"EMA {best.ema_dev}%, "
-              f"n={best.trades}, WR={best.win_rate*100:.1f}%, "
-              f"PF={best.profit_factor:.3f}, "
-              f"P&L=${best.total_pnl:+.2f}")
-    else:
-        print("  No combination met all three criteria.")
+    print(f"\n  {len(filtered)} combinations passed all filters (of {len(results)} tested)")
+    best = top[0]
+    print(f"  Best: RSI {best.rsi_os}/{best.rsi_ob:.0f}, EMA {best.ema_dev}%, "
+          f"SL {best.stop_loss*100:.0f}%, TP {best.take_profit*100:.0f}% "
+          f"-> n={best.trades}, WR={best.win_rate*100:.1f}%, "
+          f"PF={best.profit_factor:.3f}, MaxDD={best.max_drawdown:.1f}%")
 
 
 def main() -> None:
-    print("=" * 75)
-    print("  Mean Reversion Parameter Sweep — Trade Frequency Focus")
-    print("=" * 75)
+    print("=" * 95)
+    print("  Mean Reversion Parameter Sweep — Trend-Only Regime Filter")
+    print("=" * 95)
 
     results = run_sweep()
     if results:

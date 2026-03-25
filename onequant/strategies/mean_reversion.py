@@ -10,9 +10,9 @@ from strategies.base import BaseStrategy, Signal
 REQUIRED_CANDLES: int = 21
 RSI_PERIOD: int = 14
 EMA_PERIOD: int = 20
-EMA_DEVIATION_PCT: float = 3.0
-RSI_OVERSOLD: float = 20.0
-RSI_OVERBOUGHT: float = 80.0
+EMA_DEVIATION_PCT: float = 1.5
+RSI_OVERSOLD: float = 25.0
+RSI_OVERBOUGHT: float = 75.0
 VOLUME_MA_PERIOD: int = 10
 BASE_CONFIDENCE: float = 0.60
 CONFIDENCE_PER_5_RSI: float = 0.10
