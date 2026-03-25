@@ -110,3 +110,45 @@ requirement is the structural flaw — it selects for exhaustion candles
 not momentum candles. Strategy is kept in `vwap_momentum.py` for
 reference but should not be included in production backtests or live
 trading.
+
+---
+
+## Bollinger Band Reversion
+
+**File:** `strategies/bb_reversion.py`
+**Tested:** 2026-03-25
+**Verdict:** REJECTED — insufficient win rate
+
+### Results ($250 capital, 10 years 15m data, RANGING regime only)
+
+| Config | Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|---|
+| RANGING, BW < 0.04 | 2,435 | 50.8% | 0.43 | -92.0% | -$230.06 |
+
+### Why it fails
+
+Win rate of 50.8% falls short of the 54.5% minimum required for
+positive gross EV with a 3% SL / 2.5% TP setup:
+
+```
+EV = (0.508 × 2.5%) - (0.492 × 3%)
+   = 1.27% - 1.48% = -0.21% per trade (gross)
+
+After fees (0.4% round-trip) + slippage (0.1%) + spread (0.05%):
+Net EV = -0.21% - 0.55% = -0.76% per trade
+```
+
+### Root cause
+
+2,435 trades in RANGING-only proves the bandwidth < 0.04 filter
+fires too loosely — it is not selecting high-probability setups.
+Tightening bandwidth reduces trade quantity but not signal quality;
+the underlying WR stays below the breakeven threshold regardless.
+Same structural flaw as Breakout and VWAP Momentum: the filter
+conditions do not isolate genuinely predictive moments.
+
+### Not worth pursuing
+
+No parameter variation can fix insufficient win rate. Strategy is
+kept in `bb_reversion.py` for reference but should not be included
+in production backtests or live trading.
