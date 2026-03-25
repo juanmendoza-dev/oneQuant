@@ -41,6 +41,15 @@ def main() -> None:
             order_type="limit",
         ),
         BacktestConfig(
+            strategy=MeanReversionStrategy(),
+            timeframe=TIMEFRAME,
+            initial_capital=CAPITAL,
+            take_profit_pct=0.03,
+            stop_loss_pct=0.06,
+            order_type="limit",
+            allowed_regimes=["BULL_TREND", "BEAR_TREND"],
+        ),
+        BacktestConfig(
             strategy=NewsDrivenStrategy(),
             timeframe=TIMEFRAME,
             initial_capital=CAPITAL,
@@ -50,10 +59,14 @@ def main() -> None:
     comparison: list[tuple[str, Metrics]] = []
 
     for cfg in configs:
-        print(f"\nRunning backtest: {cfg.strategy.name} ...")
+        label = cfg.strategy.name
+        if cfg.allowed_regimes:
+            label += " (trend only)"
+        print(f"\nRunning backtest: {label} ...")
         result = run_backtest(cfg)
+        result.strategy_name = label
         metrics = print_report(result)
-        comparison.append((cfg.strategy.name, metrics))
+        comparison.append((label, metrics))
 
     print_comparison(comparison)
 
