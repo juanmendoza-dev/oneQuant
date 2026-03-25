@@ -1,10 +1,11 @@
 """Strategy C — News Driven.
 
 Combines recent news headline sentiment with the Fear & Greed Index to
-generate directional signals. This strategy queries the database directly
-for news and sentiment data.
+generate directional signals. News and fear/greed data are bulk-loaded
+once via _preload_data() before the backtest loop starts.
 """
 
+import bisect
 import sqlite3
 
 from config import config
@@ -27,34 +28,76 @@ class NewsDrivenStrategy(BaseStrategy):
     timeframe: str = "15m"
     required_candles: int = REQUIRED_CANDLES
 
-    def _query_news(self, since_ts: int) -> dict[str, int]:
-        """Count positive and negative headlines since the given timestamp."""
+    def __init__(self) -> None:
+        self._fg_cache: dict[int, int] | None = None
+        self._fg_timestamps: list[int] = []
+        self._news_cache: list[tuple[int, str]] | None = None
+
+    def _preload_data(self, start_ts: int, end_ts: int) -> None:
+        """Bulk-load all fear_greed and news_feed rows for the backtest range.
+
+        Called once by the engine before the main candle loop.
+        """
         conn = sqlite3.connect(config.DATABASE_PATH)
         try:
-            cursor = conn.execute(
-                "SELECT sentiment, COUNT(*) FROM news_feed "
-                "WHERE timestamp >= ? GROUP BY sentiment",
-                (since_ts,),
-            )
-            counts: dict[str, int] = {"positive": 0, "negative": 0, "neutral": 0}
-            for sentiment, count in cursor.fetchall():
-                if sentiment in counts:
-                    counts[sentiment] = count
-            return counts
+            # Load fear & greed — keyed by timestamp for fast lookup
+            rows = conn.execute(
+                "SELECT timestamp, score FROM fear_greed "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp ASC",
+                (start_ts, end_ts),
+            ).fetchall()
+            if not rows:
+                print(
+                    "WARNING: fear_greed table has 0 rows in backtest range "
+                    "— News Driven strategy will SKIP all candles"
+                )
+                self._fg_cache = {}
+                self._fg_timestamps = []
+            else:
+                self._fg_cache = {ts: score for ts, score in rows}
+                self._fg_timestamps = sorted(self._fg_cache.keys())
+
+            # Load news feed — sorted by timestamp for windowed lookups
+            rows = conn.execute(
+                "SELECT timestamp, sentiment FROM news_feed "
+                "WHERE timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp ASC",
+                (start_ts, end_ts),
+            ).fetchall()
+            if not rows:
+                print(
+                    "WARNING: news_feed table has 0 rows in backtest range "
+                    "— News Driven strategy will SKIP all candles"
+                )
+                self._news_cache = []
+            else:
+                self._news_cache = [(ts, sentiment) for ts, sentiment in rows]
         finally:
             conn.close()
 
-    def _query_fear_greed(self) -> int | None:
-        """Return the most recent Fear & Greed score, or None if unavailable."""
-        conn = sqlite3.connect(config.DATABASE_PATH)
-        try:
-            cursor = conn.execute(
-                "SELECT score FROM fear_greed ORDER BY timestamp DESC LIMIT 1"
-            )
-            row = cursor.fetchone()
-            return row[0] if row else None
-        finally:
-            conn.close()
+    def _query_fear_greed(self, current_ts: int) -> int | None:
+        """Return the most recent Fear & Greed score at or before current_ts."""
+        if not self._fg_timestamps:
+            return None
+        idx = bisect.bisect_right(self._fg_timestamps, current_ts) - 1
+        if idx < 0:
+            return None
+        return self._fg_cache[self._fg_timestamps[idx]]
+
+    def _query_news(self, since_ts: int, until_ts: int) -> dict[str, int]:
+        """Count positive/negative/neutral headlines in [since_ts, until_ts]."""
+        counts: dict[str, int] = {"positive": 0, "negative": 0, "neutral": 0}
+        if not self._news_cache:
+            return counts
+        lo = bisect.bisect_left(self._news_cache, (since_ts,))
+        for i in range(lo, len(self._news_cache)):
+            ts, sentiment = self._news_cache[i]
+            if ts > until_ts:
+                break
+            if sentiment in counts:
+                counts[sentiment] += 1
+        return counts
 
     def generate_signal(self, candles: list[dict]) -> Signal:
         """Generate a news-driven signal from recent headlines and Fear & Greed.
@@ -65,20 +108,26 @@ class NewsDrivenStrategy(BaseStrategy):
             - fear_greed < 20 (Extreme Fear) → SKIP regardless
             - Otherwise → SKIP
         """
+        if self._fg_cache is None:
+            return Signal("SKIP", 0.0, "News data not preloaded")
+
+        if not self._fg_timestamps and not self._news_cache:
+            return Signal("SKIP", 0.0, "Insufficient news history")
+
         if len(candles) < REQUIRED_CANDLES:
             return Signal("SKIP", 0.0, f"Need {REQUIRED_CANDLES} candles, got {len(candles)}")
 
         current_ts = candles[-1]["timestamp"]
         since_ts = current_ts - NEWS_WINDOW_SECONDS
 
-        fg_score = self._query_fear_greed()
+        fg_score = self._query_fear_greed(current_ts)
         if fg_score is None:
             return Signal("SKIP", 0.0, "No Fear & Greed data available")
 
         if fg_score < FG_EXTREME_FEAR_THRESHOLD:
             return Signal("SKIP", 0.0, f"Extreme Fear (F&G={fg_score}) — standing aside")
 
-        news_counts = self._query_news(since_ts)
+        news_counts = self._query_news(since_ts, current_ts)
 
         if (
             news_counts["positive"] >= POSITIVE_HEADLINE_THRESHOLD

@@ -342,12 +342,16 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
     if not candles:
         raise RuntimeError("No candles loaded — check timeframe and date range")
 
+    # Allow strategies to bulk-load auxiliary data (e.g. news, fear & greed)
+    # before the main loop — avoids per-candle database queries.
+    strategy = cfg.strategy
+    if hasattr(strategy, "_preload_data"):
+        strategy._preload_data(cfg.start_ts, cfg.end_ts)
+
     # Pre-compute EMA200 for regime detection (no lookahead — each index
     # only depends on closes at or before that index)
     all_closes = [c["close"] for c in candles]
     ema200 = _calculate_ema_series(all_closes, REGIME_EMA_PERIOD)
-
-    strategy = cfg.strategy
     trades: list[TradeResult] = []
     position: Optional[_OpenPosition] = None
     capital = cfg.initial_capital
