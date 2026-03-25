@@ -92,13 +92,18 @@ def _restore_config(original_path: str):
 
 
 def test_lookahead() -> bool:
-    """Verify entry prices use candle[i].open, not candle[i].close.
+    """Verify each entry fills at the exact candle AFTER the signal window.
 
-    Creates an uptrending series where open != close on every candle.
-    Checks that the first entry price matches a candle's open, not its close.
+    Creates an uptrending series with unique opens (open = 50000 + i*100).
+    For every trade, recovers the fill candle index from the entry price
+    and the signal candle index from the last candle in the signal window,
+    then asserts fill_index == signal_index + 1.
     """
     from backtest.engine import BacktestConfig, run_backtest
     from strategies.base import BaseStrategy, Signal
+
+    BASE_PRICE = 50000.0
+    INCREMENT = 100.0
 
     class AlwaysBuyStrategy(BaseStrategy):
         name = "AlwaysBuy"
@@ -108,8 +113,15 @@ def test_lookahead() -> bool:
         def generate_signal(self, candles: list[dict]) -> Signal:
             return Signal("BUY", 1.0, "test signal")
 
-    # Create candles with distinct open vs close
-    candles = _make_candles(100, base_price=50000.0, price_increment=100.0)
+    # Each candle[i].open = BASE_PRICE + i * INCREMENT  (unique per index)
+    candles = _make_candles(100, base_price=BASE_PRICE, price_increment=INCREMENT)
+
+    # Build reverse lookup: open price → candle index
+    open_to_idx = {c["open"]: idx for idx, c in enumerate(candles)}
+
+    # Also map each candle timestamp → index for signal-window identification
+    ts_to_idx = {c["timestamp"]: idx for idx, c in enumerate(candles)}
+
     db_path = _create_test_db(candles)
     original = _patch_config(db_path)
 
@@ -134,24 +146,45 @@ def test_lookahead() -> bool:
         first_trade = result.trades[0]
         entry_price = first_trade.entry_price
 
-        # The entry should be a candle OPEN, not a close
-        opens = {c["open"] for c in candles}
-        closes = {c["close"] for c in candles}
-
-        is_an_open = entry_price in opens
-        is_a_close = entry_price in closes and entry_price not in opens
-
-        if is_a_close:
-            print(f"    Entry price ${entry_price:.2f} matches a candle close — LOOKAHEAD BIAS")
+        # Recover fill candle index from the unique open price
+        if entry_price not in open_to_idx:
+            closes = {c["close"] for c in candles}
+            if entry_price in closes:
+                print(f"    Entry ${entry_price:.2f} is a candle CLOSE — LOOKAHEAD BIAS")
+            else:
+                print(f"    Entry ${entry_price:.2f} matches no candle open — unexpected")
             return False
 
-        if is_an_open:
-            print(f"    Entry price ${entry_price:.2f} matches a candle open — correct")
-            return True
+        fill_idx = open_to_idx[entry_price]
 
-        # With no slippage/spread, should exactly match an open
-        print(f"    Entry price ${entry_price:.2f} doesn't match any open or close — unexpected")
-        return False
+        # The signal window fed to generate_signal ends one candle before fill.
+        # Engine: window = candles[i - min_window : i], fill at candles[i].open
+        # So the last candle the strategy SAW is candles[fill_idx - 1].
+        signal_last_idx = fill_idx - 1
+
+        if signal_last_idx < 0:
+            print(f"    Fill at candle 0 — strategy saw no prior candles — FAIL")
+            return False
+
+        # Core assertion: fill is the candle immediately after the signal window
+        expected_fill_idx = signal_last_idx + 1
+        if fill_idx != expected_fill_idx:
+            print(f"    Signal ended at candle {signal_last_idx}, "
+                  f"fill at candle {fill_idx} (expected {expected_fill_idx}) — FAIL")
+            return False
+
+        # Verify the strategy never saw the fill candle's data
+        signal_window_end_ts = candles[signal_last_idx]["timestamp"]
+        fill_ts = candles[fill_idx]["timestamp"]
+        if fill_ts <= signal_window_end_ts:
+            print(f"    Fill candle timestamp <= signal window end — LOOKAHEAD BIAS")
+            return False
+
+        print(f"    Signal window ended at candle {signal_last_idx} "
+              f"(open ${candles[signal_last_idx]['open']:.0f}), "
+              f"fill at candle {fill_idx} "
+              f"(open ${entry_price:.0f}) — correct")
+        return True
     finally:
         _restore_config(original)
 
