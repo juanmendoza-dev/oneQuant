@@ -189,6 +189,7 @@ class BacktestConfig:
     spread_pct: float = DEFAULT_SPREAD_PCT
     order_type: str = "limit"  # 'limit' or 'market'
     allowed_regimes: Optional[list[str]] = None  # None → trade all regimes
+    symbol: str = "BTC-USD"
 
 
 @dataclass
@@ -222,6 +223,7 @@ def _load_candles(
     timeframe: str,
     start_ts: Optional[int],
     end_ts: Optional[int],
+    symbol: str = "BTC-USD",
 ) -> list[dict]:
     """Load candles from the database, sorted by timestamp ascending."""
     conn = sqlite3.connect(config.DATABASE_PATH)
@@ -229,9 +231,9 @@ def _load_candles(
     try:
         query = (
             "SELECT timestamp, open, high, low, close, volume "
-            "FROM btc_candles WHERE timeframe = ?"
+            "FROM btc_candles WHERE symbol = ? AND timeframe = ?"
         )
-        params: list = [timeframe]
+        params: list = [symbol, timeframe]
 
         if start_ts is not None:
             query += " AND timestamp >= ?"
@@ -247,17 +249,18 @@ def _load_candles(
         conn.close()
 
 
-def _ts_range(timeframe: str) -> tuple[int, int]:
-    """Return (min_ts, max_ts) for the given timeframe in the database."""
+def _ts_range(timeframe: str, symbol: str = "BTC-USD") -> tuple[int, int]:
+    """Return (min_ts, max_ts) for the given timeframe and symbol in the database."""
     conn = sqlite3.connect(config.DATABASE_PATH)
     try:
         row = conn.execute(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM btc_candles WHERE timeframe = ?",
-            (timeframe,),
+            "SELECT MIN(timestamp), MAX(timestamp) FROM btc_candles "
+            "WHERE symbol = ? AND timeframe = ?",
+            (symbol, timeframe),
         ).fetchone()
         if row and row[0] is not None:
             return (row[0], row[1])
-        raise RuntimeError(f"No candles found for timeframe {timeframe}")
+        raise RuntimeError(f"No candles found for symbol {symbol} timeframe {timeframe}")
     finally:
         conn.close()
 
@@ -332,13 +335,13 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
     - Position size compounds with current equity
     """
     if cfg.start_ts is None or cfg.end_ts is None:
-        db_min, db_max = _ts_range(cfg.timeframe)
+        db_min, db_max = _ts_range(cfg.timeframe, cfg.symbol)
         if cfg.start_ts is None:
             cfg.start_ts = db_min
         if cfg.end_ts is None:
             cfg.end_ts = db_max
 
-    candles = _load_candles(cfg.timeframe, cfg.start_ts, cfg.end_ts)
+    candles = _load_candles(cfg.timeframe, cfg.start_ts, cfg.end_ts, cfg.symbol)
     if not candles:
         raise RuntimeError("No candles loaded — check timeframe and date range")
 

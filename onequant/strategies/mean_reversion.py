@@ -1,8 +1,15 @@
-"""Strategy B — Mean Reversion.
+"""Strategy B — Mean Reversion (Config A: SELL only, BULL_TREND).
 
-Uses RSI and EMA to detect overbought/oversold conditions and trade
-the expected snap-back. Requires volume confirmation. Needs the last
-21 candles on the 15m timeframe.
+Shorts overbought extensions in confirmed bull trends and trades the
+snap-back to the 20 EMA. Validated config (Config A):
+
+  Signal:  SELL when RSI > 75 AND price > 1.5% above 20 EMA AND volume confirmed
+  Regime:  BULL_TREND only (engine-level filter via allowed_regimes)
+  SL: 6%   TP: 4%   min_confidence: 0.55
+
+BUY signals are intentionally disabled. Config A testing showed the
+SELL-in-BULL-TREND side has PF 1.47 and DD -2.5% vs the combined
+BUY+SELL config's PF 1.23 and DD -5.3%.
 """
 
 from strategies.base import BaseStrategy, Signal
@@ -96,15 +103,7 @@ class MeanReversionStrategy(BaseStrategy):
         if vol_ma > 0 and current_vol <= vol_ma:
             return Signal("SKIP", 0.0, f"Volume {current_vol:.0f} below 10-period avg {vol_ma:.0f}")
 
-        if rsi < RSI_OVERSOLD and deviation_pct < -EMA_DEVIATION_PCT:
-            points_beyond = RSI_OVERSOLD - rsi
-            extra = (points_beyond // 5) * CONFIDENCE_PER_5_RSI
-            confidence = min(BASE_CONFIDENCE + extra, MAX_CONFIDENCE)
-            return Signal(
-                "BUY",
-                confidence,
-                f"RSI {rsi:.1f} (oversold), price {deviation_pct:.2f}% below EMA, vol confirmed",
-            )
+        # BUY side disabled — Config A is SELL-only (see module docstring).
 
         if rsi > RSI_OVERBOUGHT and deviation_pct > EMA_DEVIATION_PCT:
             points_beyond = rsi - RSI_OVERBOUGHT

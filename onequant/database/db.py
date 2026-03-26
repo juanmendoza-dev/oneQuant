@@ -15,6 +15,7 @@ from config import config
 CREATE_BTC_CANDLES: str = """
 CREATE TABLE IF NOT EXISTS btc_candles (
     id INTEGER PRIMARY KEY,
+    symbol TEXT NOT NULL DEFAULT 'BTC-USD',
     timestamp INTEGER NOT NULL,
     timeframe TEXT NOT NULL,
     open REAL NOT NULL,
@@ -23,7 +24,7 @@ CREATE TABLE IF NOT EXISTS btc_candles (
     close REAL NOT NULL,
     volume REAL NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE(timestamp, timeframe)
+    UNIQUE(symbol, timestamp, timeframe)
 )"""
 
 CREATE_NEWS_FEED: str = """
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS system_log (
 )"""
 
 CREATE_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_candles_symbol ON btc_candles(symbol)",
     "CREATE INDEX IF NOT EXISTS idx_candles_ts ON btc_candles(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_candles_tf ON btc_candles(timeframe)",
     "CREATE INDEX IF NOT EXISTS idx_news_ts ON news_feed(timestamp)",
@@ -116,28 +118,30 @@ async def insert_candle(
     low: float,
     close: float,
     volume: float,
+    symbol: str = "BTC-USD",
 ) -> None:
     """Insert a completed candle into btc_candles. Skips duplicates."""
     conn = _get_conn()
     await conn.execute(
         """INSERT OR IGNORE INTO btc_candles
-           (timestamp, timeframe, open, high, low, close, volume, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (timestamp, timeframe, open_, high, low, close, volume, int(time.time())),
+           (symbol, timestamp, timeframe, open, high, low, close, volume, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, timestamp, timeframe, open_, high, low, close, volume, int(time.time())),
     )
     await conn.commit()
 
 
 async def insert_candles_bulk(
     rows: list[tuple[int, str, float, float, float, float, float]],
+    symbol: str = "BTC-USD",
 ) -> int:
     """Bulk-insert candles. Returns number of rows actually inserted."""
     conn = _get_conn()
     cursor = await conn.executemany(
         """INSERT OR IGNORE INTO btc_candles
-           (timestamp, timeframe, open, high, low, close, volume, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        [(ts, tf, o, h, l, c, v, int(time.time())) for ts, tf, o, h, l, c, v in rows],
+           (symbol, timestamp, timeframe, open, high, low, close, volume, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(symbol, ts, tf, o, h, l, c, v, int(time.time())) for ts, tf, o, h, l, c, v in rows],
     )
     await conn.commit()
     return cursor.rowcount
@@ -205,12 +209,12 @@ async def get_table_count(table: str) -> int:
     return row[0] if row else 0
 
 
-async def candle_exists(timestamp: int, timeframe: str) -> bool:
-    """Check if a candle already exists for the given timestamp and timeframe."""
+async def candle_exists(timestamp: int, timeframe: str, symbol: str = "BTC-USD") -> bool:
+    """Check if a candle already exists for the given symbol, timestamp, and timeframe."""
     conn = _get_conn()
     cursor = await conn.execute(
-        "SELECT 1 FROM btc_candles WHERE timestamp = ? AND timeframe = ? LIMIT 1",
-        (timestamp, timeframe),
+        "SELECT 1 FROM btc_candles WHERE symbol = ? AND timestamp = ? AND timeframe = ? LIMIT 1",
+        (symbol, timestamp, timeframe),
     )
     row = await cursor.fetchone()
     return row is not None

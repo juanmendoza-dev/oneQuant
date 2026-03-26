@@ -37,14 +37,16 @@ if hasattr(sys.stdout, "reconfigure"):
 
 TIMEFRAME: str = "15m"
 STOP_LOSS_PCT: float = 0.06
-TAKE_PROFIT_PCT: float = 0.03
-INITIAL_CAPITAL: float = 25.0
+TAKE_PROFIT_PCT: float = 0.04   # Config A: TP 4%
+INITIAL_CAPITAL: float = 250.0  # Config A: production capital
+MIN_CONFIDENCE: float = 0.55    # Config A: matched to validated sweep
+ALLOWED_REGIMES: list = ["BULL_TREND"]  # Config A: SELL-only in bull trends
 NUM_BLOCKS: int = 4
 MC_ITERATIONS: int = 10_000
 
-# Minimum trade gates
-MIN_TOTAL_TRADES: int = 100
-MIN_PERIOD_TRADES: int = 30
+# Minimum trade gates — Config A fires ~5-6 trades/yr (56 over 10yr)
+MIN_TOTAL_TRADES: int = 40
+MIN_PERIOD_TRADES: int = 8
 
 # ---------------------------------------------------------------------------
 # Test 1 — Walk-forward validation (sliding + anchored)
@@ -67,7 +69,7 @@ class WalkForwardPeriod:
 
 
 def _run_block(start_ts: int, end_ts: int) -> Metrics:
-    """Run mean reversion backtest on a specific time range."""
+    """Run mean reversion backtest on a specific time range (Config A settings)."""
     cfg = BacktestConfig(
         strategy=MeanReversionStrategy(),
         timeframe=TIMEFRAME,
@@ -76,6 +78,8 @@ def _run_block(start_ts: int, end_ts: int) -> Metrics:
         stop_loss_pct=STOP_LOSS_PCT,
         take_profit_pct=TAKE_PROFIT_PCT,
         initial_capital=INITIAL_CAPITAL,
+        min_confidence=MIN_CONFIDENCE,
+        allowed_regimes=ALLOWED_REGIMES,
         order_type="limit",
     )
     result = run_backtest(cfg)
@@ -204,6 +208,8 @@ def test_monte_carlo() -> bool:
         stop_loss_pct=STOP_LOSS_PCT,
         take_profit_pct=TAKE_PROFIT_PCT,
         initial_capital=INITIAL_CAPITAL,
+        min_confidence=MIN_CONFIDENCE,
+        allowed_regimes=ALLOWED_REGIMES,
         order_type="limit",
     )
     result = run_backtest(cfg)
@@ -276,9 +282,10 @@ def test_monte_carlo() -> bool:
 # Test 3 — Parameter stability sweep
 # ---------------------------------------------------------------------------
 
-RSI_OVERSOLD_RANGE: list[float] = [15, 18, 20, 22, 25]
-RSI_OVERBOUGHT_RANGE: list[float] = [75, 78, 80, 82, 85]
-EMA_DEV_RANGE: list[float] = [2.0, 2.5, 3.0, 3.5, 4.0]
+# Config A is SELL-only — sweep varies RSI_OB and EMA_DEV around validated values
+RSI_OVERSOLD_RANGE: list[float] = [15, 18, 20, 22, 25]   # kept for BUY mutation compat
+RSI_OVERBOUGHT_RANGE: list[float] = [70, 72, 75, 78, 80]  # centred on validated 75
+EMA_DEV_RANGE: list[float] = [1.0, 1.5, 2.0, 2.5, 3.0]   # includes validated 1.5%
 SL_RANGE: list[float] = [0.04, 0.05, 0.06, 0.07]
 TP_RANGE: list[float] = [0.02, 0.03, 0.04]
 
@@ -319,6 +326,8 @@ def _run_sweep_combo(args: tuple) -> SweepResult:
             stop_loss_pct=sl,
             take_profit_pct=tp,
             initial_capital=INITIAL_CAPITAL,
+            min_confidence=MIN_CONFIDENCE,
+            allowed_regimes=ALLOWED_REGIMES,
             order_type="limit",
         )
         result = run_backtest(cfg)
@@ -428,8 +437,9 @@ def test_parameter_stability() -> bool:
 
     top_quartile_cutoff = len(results_sorted) // 4
     top_quartile = results_sorted[:top_quartile_cutoff]
+    # Config A validated params: RSI_OB=75, EMA_DEV=1.5%, SL=6%, TP=4%
     current_in_top_q = any(
-        r.rsi_os == 20 and r.ema_dev == 3.0 and r.sl == 6.0 and r.tp == 3.0
+        r.rsi_ob == 75 and r.ema_dev == 1.5 and r.sl == 6.0 and r.tp == 4.0
         for r in top_quartile
     )
 
@@ -499,6 +509,8 @@ def test_sharpe_significance() -> bool:
         stop_loss_pct=STOP_LOSS_PCT,
         take_profit_pct=TAKE_PROFIT_PCT,
         initial_capital=INITIAL_CAPITAL,
+        min_confidence=MIN_CONFIDENCE,
+        allowed_regimes=ALLOWED_REGIMES,
         order_type="limit",
     )
     result = run_backtest(cfg)

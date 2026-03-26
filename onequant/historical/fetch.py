@@ -10,6 +10,7 @@ Usage:
     python -m historical.fetch
 """
 
+import argparse
 import asyncio
 import hashlib
 import hmac
@@ -34,7 +35,7 @@ from database.db import close_db, init_db, insert_candles_bulk, insert_system_lo
 
 MODULE_NAME: str = "historical"
 BASE_URL: str = "https://api.coinbase.com"
-PRODUCT_ID: str = "BTC-USD"
+DEFAULT_PRODUCT_ID: str = "BTC-USD"
 CANDLES_PER_REQUEST: int = 300
 RATE_LIMIT_DELAY: float = 0.35  # seconds between API calls
 
@@ -108,10 +109,11 @@ async def _fetch_candles_page(
     start: int,
     end: int,
     granularity: str,
+    product_id: str = DEFAULT_PRODUCT_ID,
 ) -> list[dict[str, Any]]:
     """Fetch a single page of candles from the Coinbase API."""
     path = (
-        f"/api/v3/brokerage/market/products/{PRODUCT_ID}/candles"
+        f"/api/v3/brokerage/market/products/{product_id}/candles"
         f"?start={start}&end={end}&granularity={granularity}"
     )
     headers = _auth_headers("GET", path)
@@ -124,7 +126,12 @@ async def _fetch_candles_page(
         return data.get("candles", [])
 
 
-async def _fetch_timeframe(tf_label: str, granularity: str, interval: int) -> int:
+async def _fetch_timeframe(
+    tf_label: str,
+    granularity: str,
+    interval: int,
+    product_id: str = DEFAULT_PRODUCT_ID,
+) -> int:
     """Fetch all historical candles for a single timeframe. Returns insert count."""
     now = int(time.time())
     earliest = EARLIEST_TIMESTAMP
@@ -134,7 +141,7 @@ async def _fetch_timeframe(tf_label: str, granularity: str, interval: int) -> in
     total_pages = ((now - earliest) // page_span) + 1
     total_inserted = 0
 
-    logger.info("Fetching %s candles from %d to %d (%d pages)", tf_label, earliest, now, total_pages)
+    logger.info("Fetching %s %s candles from %d to %d (%d pages)", product_id, tf_label, earliest, now, total_pages)
 
     async with aiohttp.ClientSession() as session:
         current_end = now
@@ -144,7 +151,7 @@ async def _fetch_timeframe(tf_label: str, granularity: str, interval: int) -> in
 
                 try:
                     candles = await _fetch_candles_page(
-                        session, current_start, current_end, granularity
+                        session, current_start, current_end, granularity, product_id
                     )
                 except Exception as exc:
                     msg = f"Fetch error ({tf_label}): {exc}"
@@ -175,7 +182,7 @@ async def _fetch_timeframe(tf_label: str, granularity: str, interval: int) -> in
                             logger.warning("Skipping malformed candle: %s", exc)
 
                     if rows:
-                        inserted = await insert_candles_bulk(rows)
+                        inserted = await insert_candles_bulk(rows, symbol=product_id)
                         total_inserted += inserted
 
                 pbar.update(1)
@@ -185,22 +192,22 @@ async def _fetch_timeframe(tf_label: str, granularity: str, interval: int) -> in
     return total_inserted
 
 
-async def run_historical_fetch() -> None:
+async def run_historical_fetch(product_id: str = DEFAULT_PRODUCT_ID) -> None:
     """Fetch historical candles for all timeframes and store in the database."""
     _setup_logging()
     await init_db()
 
     print("=" * 60)
     print("oneQuant — Historical OHLCV Fetcher")
-    print(f"Product: {PRODUCT_ID}")
+    print(f"Product: {product_id}")
     years = (int(time.time()) - EARLIEST_TIMESTAMP) / SECONDS_PER_YEAR
     print(f"Target lookback: {years:.1f} years (back to 2016-01-01)")
     print("=" * 60)
 
     grand_total = 0
     for tf_label, (granularity, interval) in TIMEFRAME_MAP.items():
-        inserted = await _fetch_timeframe(tf_label, granularity, interval)
-        logger.info("%s: inserted %d candles", tf_label, inserted)
+        inserted = await _fetch_timeframe(tf_label, granularity, interval, product_id)
+        logger.info("%s %s: inserted %d candles", product_id, tf_label, inserted)
         grand_total += inserted
 
     print(f"\nTotal candles inserted: {grand_total}")
@@ -213,4 +220,11 @@ async def run_historical_fetch() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    asyncio.run(run_historical_fetch())
+    parser = argparse.ArgumentParser(description="Fetch historical OHLCV candles")
+    parser.add_argument(
+        "--symbol",
+        default=DEFAULT_PRODUCT_ID,
+        help=f"Coinbase product ID to fetch (default: {DEFAULT_PRODUCT_ID})",
+    )
+    args = parser.parse_args()
+    asyncio.run(run_historical_fetch(product_id=args.symbol))
