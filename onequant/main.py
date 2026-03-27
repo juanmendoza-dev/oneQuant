@@ -20,6 +20,7 @@ from config import config
 from database.db import close_db, get_table_count, init_db, insert_system_log
 from feeds.coinbase_ws import run_coinbase_ws
 from feeds.news import run_fear_greed_poller, run_news_poller
+from paper_trading.paper_engine import run_paper_engine
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -27,7 +28,7 @@ from feeds.news import run_fear_greed_poller, run_news_poller
 
 MODULE_NAME: str = "main"
 BANNER: str = "oneQuant v0.1 — data pipeline running"
-TABLES: list[str] = ["btc_candles", "news_feed", "fear_greed", "system_log"]
+TABLES: list[str] = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -92,6 +93,7 @@ async def main() -> None:
         asyncio.create_task(run_coinbase_ws(), name="coinbase_ws"),
         asyncio.create_task(run_news_poller(), name="crypto_news"),
         asyncio.create_task(run_fear_greed_poller(), name="fear_greed"),
+        asyncio.create_task(run_paper_engine(), name="paper_engine"),
     ]
 
     # Graceful shutdown on SIGINT / SIGTERM
