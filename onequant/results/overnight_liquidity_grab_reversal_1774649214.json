@@ -1,0 +1,12 @@
+{
+  "strategy_name": "Overnight Liquidity Grab Reversal",
+  "slug": "overnight_liquidity_grab_reversal",
+  "timestamp": "2026-03-27T22:06:54.543737+00:00",
+  "verdict": "ERROR",
+  "win_rate_pct": 0.0,
+  "profit_factor": 0.0,
+  "max_drawdown_pct": 0.0,
+  "total_trades": 0,
+  "total_pnl": 0.0,
+  "failure_reason": "BacktestError: no such table: btc_candles"
+}

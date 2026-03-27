@@ -28,13 +28,13 @@ def _create_test_db(candles: list[dict], timeframe: str = "15m") -> str:
     conn.execute(
         "CREATE TABLE btc_candles ("
         "  timestamp INTEGER, open REAL, high REAL, low REAL, "
-        "  close REAL, volume REAL, timeframe TEXT, "
+        "  close REAL, volume REAL, timeframe TEXT, symbol TEXT DEFAULT 'BTC-USD', "
         "  UNIQUE(timestamp, timeframe))"
     )
     for c in candles:
         conn.execute(
-            "INSERT INTO btc_candles (timestamp, open, high, low, close, volume, timeframe) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO btc_candles (timestamp, open, high, low, close, volume, timeframe, symbol) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'BTC-USD')",
             (c["timestamp"], c["open"], c["high"], c["low"], c["close"], c["volume"], timeframe),
         )
     conn.commit()
