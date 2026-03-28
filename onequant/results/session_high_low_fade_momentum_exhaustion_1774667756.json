@@ -1,0 +1,12 @@
+{
+  "strategy_name": "Session High/Low Fade Momentum Exhaustion",
+  "slug": "session_high_low_fade_momentum_exhaustion",
+  "timestamp": "2026-03-28T03:15:56.406744+00:00",
+  "verdict": "FAIL",
+  "win_rate_pct": 56.3,
+  "profit_factor": 0.554,
+  "max_drawdown_pct": 50.03,
+  "total_trades": 492,
+  "total_pnl": -125.07,
+  "failure_reason": "PF 0.554 < 1.0 threshold; MaxDD 50.0% exceeds 20.0% limit"
+}

@@ -3,6 +3,7 @@
 import hashlib
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,17 @@ VALIDATED_STRATEGIES = {"mean_reversion"}
 
 BACKTEST_PREDICTED_WR = 76.8
 
+STRATEGY_COLORS = {
+    "mean_reversion": "#9b59b6",
+    "capitulation": "#e67e22",
+    "ema_pullback": "#06b6d4",
+    "momentum": "#eab308",
+    "mtf_mean_reversion": "#22c55e",
+    "news_driven": "#ec4899",
+    "rsi_divergence": "#ef4444",
+    "trend_exhaustion": "#3b82f6",
+}
+
 
 def get_db():
     conn = sqlite3.connect(str(DB_PATH))
@@ -44,9 +56,55 @@ def get_db():
 # --------------------------------------------------------------------------- #
 
 
+def _service_active(name: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def _db_counts() -> list[dict]:
+    tables = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"]
+    results = []
+    try:
+        conn = get_db()
+        for t in tables:
+            count = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: S608
+            results.append({"label": t, "value": count})
+        conn.close()
+    except Exception:
+        pass
+    return results
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    svc_names = [
+        ("onequant", "Trading Engine"),
+        ("onequant-api", "API Server"),
+        ("nginx", "Nginx"),
+        ("cloudflared", "Cloudflare Tunnel"),
+    ]
+    services = []
+    for svc_id, label in svc_names:
+        active = _service_active(svc_id)
+        services.append({
+            "name": label,
+            "healthy": active,
+            "status": "RUNNING" if active else "DOWN",
+            "detail": "",
+        })
+
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": services,
+        "db_stats": _db_counts(),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +263,85 @@ def candles(limit: int = Query(default=100, le=5000)):
 # --------------------------------------------------------------------------- #
 
 
+@app.get("/api/paper-race")
+def paper_race(timeframe: str = Query(default="15m")):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT strategy, signal_time, exit_time, pnl, status, "
+            "entry_price, exit_price, direction "
+            "FROM paper_trades WHERE timeframe = ? ORDER BY signal_time ASC",
+            (timeframe,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+
+    # Check for open positions
+    open_positions = set()
+    try:
+        conn2 = get_db()
+        open_rows = conn2.execute(
+            "SELECT DISTINCT strategy FROM paper_trades WHERE status = 'OPEN'"
+        ).fetchall()
+        open_positions = {r["strategy"] for r in open_rows}
+        conn2.close()
+    except Exception:
+        pass
+
+    # Group trades by strategy
+    by_strategy: dict[str, list] = {}
+    for r in rows:
+        s = r["strategy"]
+        if s not in by_strategy:
+            by_strategy[s] = []
+        by_strategy[s].append(dict(r))
+
+    # All known strategies (even those with no trades yet)
+    all_strats = set(STRATEGY_COLORS.keys()) | set(by_strategy.keys())
+
+    strategies = []
+    for name in sorted(all_strats):
+        color = STRATEGY_COLORS.get(name, "#888888")
+        trades_raw = by_strategy.get(name, [])
+        cumulative = 0.0
+        trades = []
+        wins = 0
+        closed = 0
+        for t in trades_raw:
+            if t["status"] in ("WIN", "LOSS"):
+                pnl = t["pnl"] or 0.0
+                cumulative += pnl
+                closed += 1
+                if t["status"] == "WIN":
+                    wins += 1
+                trades.append({
+                    "time": datetime.fromtimestamp(
+                        t["exit_time"] or t["signal_time"], tz=timezone.utc
+                    ).isoformat(),
+                    "pnl": round(pnl, 2),
+                    "cumulative_pnl": round(cumulative, 2),
+                    "result": t["status"],
+                    "entry_price": t["entry_price"],
+                    "exit_price": t["exit_price"],
+                })
+
+        wr = round((wins / closed) * 100, 2) if closed > 0 else 0.0
+        strategies.append({
+            "name": name,
+            "color": color,
+            "trades": trades,
+            "current_pnl": round(cumulative, 2),
+            "win_rate": wr,
+            "predicted_wr": BACKTEST_PREDICTED_WR,
+            "is_beating_prediction": wr >= BACKTEST_PREDICTED_WR if closed > 0 else False,
+            "open_position": name in open_positions,
+        })
+
+    return {"strategies": strategies}
+
+
 @app.get("/api/system-logs")
 def system_logs(limit: int = Query(default=50, le=500)):
     conn = get_db()
@@ -213,7 +350,16 @@ def system_logs(limit: int = Query(default=50, le=500)):
             "SELECT * FROM system_log ORDER BY timestamp DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        results = []
+        for r in rows:
+            d = dict(r)
+            ts = d.get("timestamp")
+            if isinstance(ts, (int, float)):
+                d["ts"] = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+            else:
+                d["ts"] = str(ts) if ts else ""
+            results.append(d)
+        return results
     except sqlite3.OperationalError:
         return []
     finally:

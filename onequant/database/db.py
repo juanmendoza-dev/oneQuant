@@ -227,7 +227,7 @@ async def insert_system_log(module: str, level: str, message: str) -> None:
 
 async def get_table_count(table: str) -> int:
     """Get the row count for a given table."""
-    allowed = {"btc_candles", "news_feed", "fear_greed", "system_log"}
+    allowed = {"btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"}
     if table not in allowed:
         raise ValueError(f"Unknown table: {table}")
     conn = _get_conn()

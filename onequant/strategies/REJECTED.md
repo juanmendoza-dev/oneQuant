@@ -152,3 +152,110 @@ conditions do not isolate genuinely predictive moments.
 No parameter variation can fix insufficient win rate. Strategy is
 kept in `bb_reversion.py` for reference but should not be included
 in production backtests or live trading.
+
+---
+
+## Capitulation
+
+**File:** `strategies/capitulation.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — PF 0.559 < 1.0; MaxDD 37.1% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 336 | 57.7% | 0.559 | -37.1% | -$92.47 |
+
+Despite adequate win rate (57.7%), profit factor is 0.559 — losses
+are nearly twice as large as wins. MaxDD of 37.1% exceeds 20% limit.
+
+---
+
+## EMA Pullback
+
+**File:** `strategies/ema_pullback.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — PF 0.692 < 1.0; MaxDD 72.6% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 1,516 | 60.6% | 0.692 | -72.6% | -$180.71 |
+
+High trade count with 60.6% WR but PF 0.692 and catastrophic 72.6%
+drawdown. Losing trades are too large relative to winners.
+
+---
+
+## Momentum
+
+**File:** `strategies/momentum.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — PF 0.771 < 1.0; MaxDD 67.8% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 1,778 | 62.1% | 0.771 | -67.8% | -$168.79 |
+
+Highest WR of the batch (62.1%) but still PF < 1.0 with 67.8%
+drawdown. The TP:SL ratio is unfavorable — wins are too small.
+
+---
+
+## MTF Mean Reversion
+
+**File:** `strategies/mtf_mean_reversion.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — PF 0.796 < 1.0
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 74 | 63.5% | 0.796 | -6.0% | -$9.32 |
+
+Low drawdown (6.0%) and decent WR (63.5%) but only 74 trades over
+10 years and PF 0.796. Multi-timeframe alignment filters too
+aggressively, leaving insufficient sample size.
+
+---
+
+## News Driven
+
+**File:** `strategies/news_driven.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — 0 trades; depends on news_feed table data
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 0 | 0.0% | 0.000 | 0.0% | $0.00 |
+
+Strategy requires news_feed table data which was empty during
+backtest. Even with data, the strategy violates the OHLCV-only
+constraint for backtest reproducibility.
+
+---
+
+## RSI Divergence
+
+**File:** `strategies/rsi_divergence.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 54.4% < 55%; PF 0.519 < 1.0; MaxDD 86.3% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 1,404 | 54.4% | 0.519 | -86.3% | -$214.78 |
+
+Fails all three thresholds. 86.3% drawdown is near-total capital
+destruction. Divergence signals fire too frequently with no edge.
+
+---
+
+## Trend Exhaustion
+
+**File:** `strategies/trend_exhaustion.py`
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — 2 trades only; WR 0%, PF 0.000
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 2 | 0.0% | 0.000 | -1.4% | -$3.58 |
+
+Only 2 trades over 10 years — signal conditions are too restrictive
+to produce a meaningful sample. Both trades were losses.
