@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 REQUIRED_VARS: list[str] = [
-    "COINBASE_API_KEY",
-    "COINBASE_API_SECRET",
+    "KRAKEN_API_KEY",
+    "KRAKEN_API_SECRET",
 ]
 
 
@@ -18,8 +18,8 @@ REQUIRED_VARS: list[str] = [
 class Config:
     """Application configuration loaded from environment variables."""
 
-    COINBASE_API_KEY: str
-    COINBASE_API_SECRET: str
+    KRAKEN_API_KEY: str
+    KRAKEN_API_SECRET: str
     DATABASE_PATH: str
     LOG_LEVEL: str
 
@@ -37,8 +37,8 @@ def load_config() -> Config:
         sys.exit(1)
 
     return Config(
-        COINBASE_API_KEY=os.environ["COINBASE_API_KEY"],
-        COINBASE_API_SECRET=os.environ["COINBASE_API_SECRET"],
+        KRAKEN_API_KEY=os.environ["KRAKEN_API_KEY"],
+        KRAKEN_API_SECRET=os.environ["KRAKEN_API_SECRET"],
         DATABASE_PATH=os.getenv("DATABASE_PATH", "./onequant.db"),
         LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO"),
     )

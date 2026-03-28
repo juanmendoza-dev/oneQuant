@@ -1,18 +1,11 @@
-"""Coinbase Advanced Trade WebSocket — real-time BTC-USD price feed.
+"""Kraken WebSocket v2 — real-time BTC/USD price feed.
 
-Connects to the Coinbase Advanced Trade WebSocket API, subscribes to the
-BTC-USD ticker channel, and aggregates incoming ticks into 5m, 15m, and 1h
+Connects to the Kraken WebSocket v2 API, subscribes to the ticker
+channel for BTC/USD, and aggregates incoming ticks into 5m, 15m, and 1h
 OHLCV candles. Completed candles are written to the btc_candles table.
-
-Volume note: the ticker channel provides a rolling 24h volume snapshot, not
-per-trade volume. Real-time candle volume is tracked as the delta of
-volume_24_h between ticks. For accurate per-candle volume, use the
-historical fetcher.
 """
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import time
@@ -28,10 +21,10 @@ from database.db import insert_candle, insert_system_log
 # Constants
 # ---------------------------------------------------------------------------
 
-WS_URL: str = "wss://advanced-trade-ws.coinbase.com"
-PRODUCT_ID: str = "BTC-USD"
+WS_URL: str = "wss://ws.kraken.com/v2"
+PAIR: str = "BTC/USD"
 CHANNEL: str = "ticker"
-MODULE_NAME: str = "coinbase_ws"
+MODULE_NAME: str = "kraken_ws"
 
 TIMEFRAMES: dict[str, int] = {
     "5m": 300,
@@ -41,7 +34,6 @@ TIMEFRAMES: dict[str, int] = {
 
 RECONNECT_BASE_DELAY: float = 5.0
 RECONNECT_MAX_DELAY: float = 60.0
-ERROR_RETRY_DELAY: float = 30.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -57,7 +49,7 @@ def _setup_logging() -> None:
     logger.setLevel(logging.DEBUG)
     Path("logs").mkdir(exist_ok=True)
 
-    fh = logging.FileHandler("logs/coinbase_ws.log")
+    fh = logging.FileHandler("logs/kraken_ws.log")
     fh.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler()
@@ -68,32 +60,6 @@ def _setup_logging() -> None:
     ch.setFormatter(fmt)
     logger.addHandler(fh)
     logger.addHandler(ch)
-
-
-# ---------------------------------------------------------------------------
-# Authentication
-# ---------------------------------------------------------------------------
-
-
-def _sign_subscribe(
-    api_key: str, api_secret: str, channel: str, product_ids: list[str]
-) -> dict[str, Any]:
-    """Build an authenticated subscribe message for Coinbase Advanced Trade WS."""
-    timestamp = str(int(time.time()))
-    message = timestamp + channel + ",".join(product_ids)
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return {
-        "type": "subscribe",
-        "product_ids": product_ids,
-        "channel": channel,
-        "api_key": api_key,
-        "timestamp": timestamp,
-        "signature": signature,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +143,8 @@ class CandleBuilder:
 # ---------------------------------------------------------------------------
 
 
-async def run_coinbase_ws() -> None:
-    """Connect to Coinbase WebSocket and stream BTC-USD ticks forever.
+async def run_kraken_ws() -> None:
+    """Connect to Kraken WebSocket v2 and stream BTC/USD ticks forever.
 
     Auto-reconnects with exponential backoff on disconnection.
     Never raises — all exceptions are caught and logged.
@@ -189,30 +155,44 @@ async def run_coinbase_ws() -> None:
 
     while True:
         try:
-            logger.info("Reconnect attempt — connecting to Coinbase WS (delay was %.1fs)", delay)
+            logger.info("Connecting to Kraken WS v2 (delay was %.1fs)", delay)
             async with websockets.connect(
                 WS_URL, ping_interval=30, open_timeout=30,
             ) as ws:
-                subscribe_msg = _sign_subscribe(
-                    config.COINBASE_API_KEY,
-                    config.COINBASE_API_SECRET,
-                    CHANNEL,
-                    [PRODUCT_ID],
-                )
+                # Kraken v2 subscribe message
+                subscribe_msg = {
+                    "method": "subscribe",
+                    "params": {
+                        "channel": CHANNEL,
+                        "symbol": [PAIR],
+                    },
+                }
                 await ws.send(json.dumps(subscribe_msg))
-                logger.info("Connected to Coinbase WS — subscribed to %s %s", PRODUCT_ID, CHANNEL)
+                logger.info("Connected to Kraken WS — subscribed to %s %s", PAIR, CHANNEL)
                 delay = RECONNECT_BASE_DELAY  # reset on successful connect
 
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
-                        events = msg.get("events", [])
-                        for event in events:
-                            tickers = event.get("tickers", [])
-                            for ticker in tickers:
-                                price = float(ticker["price"])
-                                vol_24h = float(ticker.get("volume_24_h", 0))
-                                await builder.on_tick(price, vol_24h, time.time())
+
+                        # Kraken v2 sends different message types
+                        channel = msg.get("channel")
+                        msg_type = msg.get("type")
+
+                        # Handle heartbeat
+                        if channel == "heartbeat":
+                            continue
+
+                        # Handle status/subscription confirmations
+                        if msg_type in ("update", "snapshot") and channel == "ticker":
+                            data_list = msg.get("data", [])
+                            for ticker in data_list:
+                                # Kraken v2 ticker fields
+                                last_price = float(ticker.get("last", 0))
+                                vol_24h = float(ticker.get("volume", 0))
+                                if last_price > 0:
+                                    await builder.on_tick(last_price, vol_24h, time.time())
+
                     except (KeyError, ValueError, TypeError) as exc:
                         logger.warning("Malformed tick: %s", exc)
 

@@ -1,9 +1,9 @@
-"""Coinbase Advanced Trade historical OHLCV candle fetcher.
+"""Kraken historical OHLCV candle fetcher.
 
-Fetches BTC-USD candles for 5m, 15m, and 1h timeframes going back to
-2016-01-01 (maximum useful Coinbase history). Paginates through the
-Coinbase API (max 300 candles per request), skips timestamps already
-in the database, and displays a progress bar.
+Fetches BTC/USD candles for 5m, 15m, and 1h timeframes going back to
+2016-01-01 using the Kraken public OHLC endpoint. Paginates using the
+'since' parameter, skips timestamps already in the database, and
+displays a progress bar.
 
 Usage:
     cd onequant/
@@ -12,13 +12,11 @@ Usage:
 
 import argparse
 import asyncio
-import hashlib
-import hmac
 import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
 from tqdm import tqdm
@@ -34,20 +32,19 @@ from database.db import close_db, init_db, insert_candles_bulk, insert_system_lo
 # ---------------------------------------------------------------------------
 
 MODULE_NAME: str = "historical"
-BASE_URL: str = "https://api.coinbase.com"
-DEFAULT_PRODUCT_ID: str = "BTC-USD"
-CANDLES_PER_REQUEST: int = 300
-RATE_LIMIT_DELAY: float = 0.35  # seconds between API calls
+BASE_URL: str = "https://api.kraken.com"
+DEFAULT_PAIR: str = "XBTUSD"
+RATE_LIMIT_DELAY: float = 1.0  # Kraken public rate limit: ~1 req/sec
 
-# Coinbase granularity names → (api_granularity, seconds, db_timeframe)
-TIMEFRAME_MAP: dict[str, tuple[str, int]] = {
-    "5m": ("FIVE_MINUTE", 300),
-    "15m": ("FIFTEEN_MINUTE", 900),
-    "1h": ("ONE_HOUR", 3600),
+# Kraken interval values (minutes) → db timeframe label
+TIMEFRAME_MAP: dict[str, int] = {
+    "5m": 5,
+    "15m": 15,
+    "1h": 60,
 }
 
 SECONDS_PER_YEAR: int = 365 * 24 * 3600
-# 2016-01-01 00:00:00 UTC — maximum useful Coinbase BTC-USD history
+# 2016-01-01 00:00:00 UTC — target start
 EARLIEST_TIMESTAMP: int = 1451606400
 
 # ---------------------------------------------------------------------------
@@ -78,80 +75,75 @@ def _setup_logging() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auth helpers
-# ---------------------------------------------------------------------------
-
-
-def _auth_headers(method: str, path: str, body: str = "") -> dict[str, str]:
-    """Generate Coinbase Advanced Trade authentication headers."""
-    timestamp = str(int(time.time()))
-    message = timestamp + method.upper() + path + body
-    signature = hmac.new(
-        config.COINBASE_API_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return {
-        "CB-ACCESS-KEY": config.COINBASE_API_KEY,
-        "CB-ACCESS-SIGN": signature,
-        "CB-ACCESS-TIMESTAMP": timestamp,
-        "Content-Type": "application/json",
-    }
-
-
-# ---------------------------------------------------------------------------
 # Fetch logic
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_candles_page(
+async def _fetch_ohlc_page(
     session: aiohttp.ClientSession,
-    start: int,
-    end: int,
-    granularity: str,
-    product_id: str = DEFAULT_PRODUCT_ID,
-) -> list[dict[str, Any]]:
-    """Fetch a single page of candles from the Coinbase API."""
-    path = (
-        f"/api/v3/brokerage/market/products/{product_id}/candles"
-        f"?start={start}&end={end}&granularity={granularity}"
-    )
-    headers = _auth_headers("GET", path)
-    async with session.get(BASE_URL + path, headers=headers) as resp:
+    pair: str,
+    interval: int,
+    since: Optional[int] = None,
+) -> tuple[list[list], Optional[int]]:
+    """Fetch a single page of OHLC data from Kraken.
+
+    Returns (candles_list, last_timestamp) where last_timestamp is the
+    'since' value for the next page, or None if no more data.
+    """
+    params: dict[str, Any] = {"pair": pair, "interval": interval}
+    if since is not None:
+        params["since"] = since
+
+    async with session.get(f"{BASE_URL}/0/public/OHLC", params=params) as resp:
         if resp.status != 200:
             text = await resp.text()
-            logger.error("Candles API %s: %s", resp.status, text)
-            return []
+            logger.error("OHLC API %s: %s", resp.status, text)
+            return [], None
         data = await resp.json()
-        return data.get("candles", [])
+        errors = data.get("error", [])
+        if errors:
+            logger.error("Kraken API error: %s", errors)
+            return [], None
+
+        result = data.get("result", {})
+        last = result.get("last")
+
+        # Find the candle data (key is pair name, not "last")
+        candles = []
+        for key, value in result.items():
+            if key != "last" and isinstance(value, list):
+                candles = value
+                break
+
+        return candles, last
 
 
 async def _fetch_timeframe(
     tf_label: str,
-    granularity: str,
     interval: int,
-    product_id: str = DEFAULT_PRODUCT_ID,
+    pair: str = DEFAULT_PAIR,
 ) -> int:
     """Fetch all historical candles for a single timeframe. Returns insert count."""
     now = int(time.time())
-    earliest = EARLIEST_TIMESTAMP
-    page_span = CANDLES_PER_REQUEST * interval
-
-    # Calculate total pages for progress bar
-    total_pages = ((now - earliest) // page_span) + 1
+    interval_seconds = interval * 60
+    total_candles_estimate = (now - EARLIEST_TIMESTAMP) // interval_seconds
+    # Kraken returns ~720 candles per page
+    total_pages_estimate = max(1, total_candles_estimate // 720)
     total_inserted = 0
 
-    logger.info("Fetching %s %s candles from %d to %d (%d pages)", product_id, tf_label, earliest, now, total_pages)
+    logger.info(
+        "Fetching %s %s candles from %d to %d (~%d pages)",
+        pair, tf_label, EARLIEST_TIMESTAMP, now, total_pages_estimate,
+    )
+
+    since = EARLIEST_TIMESTAMP
 
     async with aiohttp.ClientSession() as session:
-        current_end = now
-        with tqdm(total=total_pages, desc=f"  {tf_label}", unit="page") as pbar:
-            while current_end > earliest:
-                current_start = max(current_end - page_span, earliest)
-
+        with tqdm(total=total_pages_estimate, desc=f"  {tf_label}", unit="page") as pbar:
+            while since is not None:
                 try:
-                    candles = await _fetch_candles_page(
-                        session, current_start, current_end, granularity, product_id
+                    candles, new_since = await _fetch_ohlc_page(
+                        session, pair, interval, since
                     )
                 except Exception as exc:
                     msg = f"Fetch error ({tf_label}): {exc}"
@@ -162,52 +154,57 @@ async def _fetch_timeframe(
                         pass
                     await asyncio.sleep(RATE_LIMIT_DELAY)
                     pbar.update(1)
-                    current_end = current_start
-                    continue
+                    break
 
                 if candles:
                     rows = []
                     for c in candles:
                         try:
+                            # Kraken OHLC: [time, open, high, low, close, vwap, volume, count]
                             rows.append((
-                                int(c["start"]),
+                                int(c[0]),
                                 tf_label,
-                                float(c["open"]),
-                                float(c["high"]),
-                                float(c["low"]),
-                                float(c["close"]),
-                                float(c["volume"]),
+                                float(c[1]),
+                                float(c[2]),
+                                float(c[3]),
+                                float(c[4]),
+                                float(c[6]),  # volume is index 6
                             ))
-                        except (KeyError, ValueError, TypeError) as exc:
+                        except (IndexError, ValueError, TypeError) as exc:
                             logger.warning("Skipping malformed candle: %s", exc)
 
                     if rows:
-                        inserted = await insert_candles_bulk(rows, symbol=product_id)
+                        inserted = await insert_candles_bulk(rows, symbol="BTC-USD")
                         total_inserted += inserted
 
                 pbar.update(1)
-                current_end = current_start
+
+                # Stop if we've caught up or no new since value
+                if new_since is None or (since is not None and new_since == since):
+                    break
+                since = new_since
+
                 await asyncio.sleep(RATE_LIMIT_DELAY)
 
     return total_inserted
 
 
-async def run_historical_fetch(product_id: str = DEFAULT_PRODUCT_ID) -> None:
+async def run_historical_fetch(pair: str = DEFAULT_PAIR) -> None:
     """Fetch historical candles for all timeframes and store in the database."""
     _setup_logging()
     await init_db()
 
     print("=" * 60)
-    print("oneQuant — Historical OHLCV Fetcher")
-    print(f"Product: {product_id}")
+    print("oneQuant — Historical OHLCV Fetcher (Kraken)")
+    print(f"Pair: {pair}")
     years = (int(time.time()) - EARLIEST_TIMESTAMP) / SECONDS_PER_YEAR
     print(f"Target lookback: {years:.1f} years (back to 2016-01-01)")
     print("=" * 60)
 
     grand_total = 0
-    for tf_label, (granularity, interval) in TIMEFRAME_MAP.items():
-        inserted = await _fetch_timeframe(tf_label, granularity, interval, product_id)
-        logger.info("%s %s: inserted %d candles", product_id, tf_label, inserted)
+    for tf_label, interval in TIMEFRAME_MAP.items():
+        inserted = await _fetch_timeframe(tf_label, interval, pair)
+        logger.info("%s %s: inserted %d candles", pair, tf_label, inserted)
         grand_total += inserted
 
     print(f"\nTotal candles inserted: {grand_total}")
@@ -220,11 +217,11 @@ async def run_historical_fetch(product_id: str = DEFAULT_PRODUCT_ID) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fetch historical OHLCV candles")
+    parser = argparse.ArgumentParser(description="Fetch historical OHLCV candles from Kraken")
     parser.add_argument(
-        "--symbol",
-        default=DEFAULT_PRODUCT_ID,
-        help=f"Coinbase product ID to fetch (default: {DEFAULT_PRODUCT_ID})",
+        "--pair",
+        default=DEFAULT_PAIR,
+        help=f"Kraken pair to fetch (default: {DEFAULT_PAIR})",
     )
     args = parser.parse_args()
-    asyncio.run(run_historical_fetch(product_id=args.symbol))
+    asyncio.run(run_historical_fetch(pair=args.pair))

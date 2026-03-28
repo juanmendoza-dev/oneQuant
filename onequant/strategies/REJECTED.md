@@ -259,3 +259,162 @@ destruction. Divergence signals fire too frequently with no edge.
 
 Only 2 trades over 10 years — signal conditions are too restrictive
 to produce a meaningful sample. Both trades were losses.
+
+
+---
+
+## VWAP Bounce
+
+**File:** `strategies/vwap_bounce.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 48.9% < 55%; PF 0.40 < 1.0; MaxDD 92.0% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 1,677 | 48.9% | 0.40 | -92.0% | -$230.04 |
+
+Fading price deviations from daily VWAP with RSI confirmation.
+Total fees ($116.75) consumed nearly half the capital. Regime
+breakdown shows BEAR_TREND WR 63% / PF 0.88 and BULL_TREND WR 67% /
+PF 0.75 — better in trending regimes but RANGING (1,483 trades,
+WR 47%, PF 0.36) destroys overall performance. VWAP mean reversion
+on 15m candles generates too many signals in ranging markets where
+price oscillates around VWAP without meaningful deviation.
+
+---
+
+## BB Squeeze
+
+**File:** `strategies/bb_squeeze.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 42.4% < 55%; PF 0.61 < 1.0; MaxDD 51.6% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 824 | 42.4% | 0.61 | -51.6% | -$128.91 |
+
+Bollinger Band squeeze-then-expansion breakout with volume
+confirmation. 813 of 824 trades occurred in RANGING regime (WR 43%,
+PF 0.62). Only 5 trades in BULL_TREND (WR 60%, PF 1.42) — too few
+to be meaningful. The squeeze detection fires too loosely in ranging
+conditions where bandwidth oscillates naturally. False breakouts
+after squeezes are the dominant outcome on 15m timeframe.
+
+---
+
+## RSI Both Directions
+
+**File:** `strategies/rsi_both_directions.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — PF 0.72 < 1.0
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 168 | 60.7% | 0.72 | -12.1% | -$30.18 |
+
+RSI < 28 long / RSI > 72 short with 200 EMA regime filter. Best
+drawdown of the batch (-12.1%) and decent WR (60.7%), but PF 0.72
+means losses are significantly larger than wins. With TP 4% / SL 6%,
+the math requires WR > 71% to be profitable after fees. The 200 EMA
+filter helped reduce trade count (168 vs thousands) but could not
+push WR high enough. BULL_TREND showed WR 75% / PF 1.38 but only
+4 trades — noise, not signal.
+
+---
+
+## EMA Ribbon
+
+**File:** `strategies/ema_ribbon.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 43.5% < 55%; PF 0.66 < 1.0; MaxDD 86.5% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 2,517 | 43.5% | 0.66 | -86.5% | -$215.75 |
+
+5-EMA ribbon alignment with pullback to fastest EMA. Generated 2,517
+trades (4.7/week) with $235.82 in fees — fees alone nearly equal the
+total loss. The "pullback to 8 EMA" condition fires too frequently
+because price constantly touches short-period EMAs. EMA alignment
+does not reliably predict continuation on 15m candles — 2,346 of
+2,517 trades were RANGING with WR 43%.
+
+---
+
+## Opening Range
+
+**File:** `strategies/opening_range.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 46.6% < 55%; PF 0.72 < 1.0; MaxDD 87.1% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 3,245 | 46.6% | 0.72 | -87.1% | -$217.33 |
+
+First-hour range breakout. Highest trade count (3,245, 6.1/week) and
+highest total fees ($302.42). Ranging regime dominates (3,025 trades,
+WR 48%, PF 0.77). Trend regimes performed even worse (BULL_TREND
+WR 27%, BEAR_TREND WR 39%) — breakouts during trends tend to be in
+the wrong direction because the opening range captures a pullback,
+not the trend. The concept assumes meaningful range-setting behavior
+at UTC midnight, but crypto trades 24/7 with no true "opening."
+
+---
+
+## Candle Momentum
+
+**File:** `strategies/candle_momentum.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 41.8% < 55%; PF 0.57 < 1.0; MaxDD 66.8% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 1,090 | 41.8% | 0.57 | -66.8% | -$165.74 |
+
+3 consecutive same-direction candles with increasing volume. The
+pattern fires after the move has already happened — by the time
+3 candles confirm direction with rising volume, the short-term
+momentum is exhausted. WR of 41.8% means continuation is the
+minority outcome. BULL_TREND WR 31% is particularly bad — in bull
+trends, 3 bearish candles are counter-trend noise that reverses.
+
+---
+
+## Session Overlap
+
+**File:** `strategies/session_overlap.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — WR 44.1% < 55%; PF 0.61 < 1.0; MaxDD 52.7% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 854 | 44.1% | 0.61 | -52.7% | -$130.17 |
+
+EMA 9/21 crossover restricted to London/NY overlap (13:00-17:00 UTC).
+Time restriction reduced trade count vs all-hours crossover but did
+not improve signal quality. 837 of 854 trades in RANGING (WR 44%,
+PF 0.60). EMA crossovers are lagging indicators — by the time
+the 9 crosses the 21, the move that caused the cross is often
+already fading. The session window hypothesis (more liquidity =
+better signals) did not hold for this indicator type.
+
+---
+
+## Funding Reversal
+
+**File:** `strategies/funding_reversal.py` (deleted)
+**Tested:** 2026-03-28
+**Verdict:** REJECTED — PF 0.57 < 1.0; MaxDD 51.8% > 20%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 548 | 55.3% | 0.57 | -51.8% | -$128.00 |
+
+Fade exhaustion after 6+ consecutive candles with extreme RSI. WR
+passes the 55% threshold marginally, but PF 0.57 means losses dwarf
+wins. With TP 4% / SL 6%, breakeven WR is ~71%. Regime breakdown
+shows BULL_TREND WR 92% / PF 5.05 (13 trades) and BEAR_TREND WR 75%
+/ PF 1.52 (16 trades) — exhaustion fades work in trends but sample
+sizes are too small to validate. RANGING (519 trades, WR 54%,
+PF 0.53) destroys overall performance. The 6-candle run condition
+in ranging markets catches normal oscillations, not true exhaustion.

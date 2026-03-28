@@ -9,8 +9,6 @@ from backtest.engine import BacktestConfig, run_backtest
 from backtest.metrics import Metrics, calculate_metrics
 from backtest.report import print_comparison, print_report
 from strategies.mean_reversion import MeanReversionStrategy
-from strategies.momentum import MomentumStrategy
-from strategies.news_driven import NewsDrivenStrategy
 
 TIMEFRAME: str = "15m"
 CAPITAL: float = 250.0
@@ -23,15 +21,6 @@ def main() -> None:
     print("=" * 50)
 
     configs = [
-        BacktestConfig(
-            strategy=MomentumStrategy(),
-            timeframe=TIMEFRAME,
-            initial_capital=CAPITAL,
-            min_confidence=0.70,
-            take_profit_pct=0.04,
-            stop_loss_pct=0.05,
-            order_type="limit",
-        ),
         # Config A: SELL only, BULL_TREND — validated strategy
         # WR 76.8%, PF 1.47, DD -2.5%, 56 trades over 10yr
         BacktestConfig(
@@ -43,11 +32,6 @@ def main() -> None:
             min_confidence=0.55,
             order_type="limit",
             allowed_regimes=["BULL_TREND"],
-        ),
-        BacktestConfig(
-            strategy=NewsDrivenStrategy(),
-            timeframe=TIMEFRAME,
-            initial_capital=CAPITAL,
         ),
     ]
 
