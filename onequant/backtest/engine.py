@@ -4,8 +4,8 @@ Audit-hardened engine with:
 - No lookahead bias (signals use confirmed closed candles only)
 - Realistic fills at next-candle open with slippage
 - Gap-stop handling for stop losses
-- Coinbase tiered fee model (rolling 30-day volume)
-- Compounding position sizing with Coinbase $2 minimum
+- Binance.US fee model (0% maker, 0.0095% taker)
+- Compounding position sizing with $2 minimum
 - Bid-ask spread modeling
 - Market regime detection (200-EMA slope)
 - Time-of-day and day-of-week tracking per trade
@@ -29,8 +29,8 @@ DEFAULT_POSITION_SIZE_PCT: float = 0.10
 DEFAULT_STOP_LOSS_PCT: float = 0.02
 DEFAULT_TAKE_PROFIT_PCT: float = 0.03
 DEFAULT_MIN_CONFIDENCE: float = 0.65
-DEFAULT_SLIPPAGE_PCT: float = 0.001
-DEFAULT_SPREAD_PCT: float = 0.0005
+DEFAULT_SLIPPAGE_PCT: float = 0.0003   # 0.03% slippage
+DEFAULT_SPREAD_PCT: float = 0.0001     # 0.01% spread
 MIN_POSITION_SIZE: float = 2.0
 
 THIRTY_DAYS_SECONDS: int = 30 * 24 * 3600
@@ -40,14 +40,13 @@ REGIME_BULL_THRESHOLD: float = 0.015
 REGIME_BEAR_THRESHOLD: float = -0.015
 
 # ---------------------------------------------------------------------------
-# Coinbase Advanced Trade fee tiers (2026)
+# Binance.US fee schedule (Tier 0 — BTC/USD)
 # ---------------------------------------------------------------------------
 
 FEE_TIERS: list[tuple[float, float, float]] = [
     # (monthly_volume_cap, maker_fee, taker_fee)
-    (10_000, 0.0040, 0.0060),
-    (50_000, 0.0025, 0.0040),
-    (float("inf"), 0.0010, 0.0020),
+    # Binance.US: 0% maker, 0.0095% taker for BTC/USD
+    (float("inf"), 0.0000, 0.000095),
 ]
 
 

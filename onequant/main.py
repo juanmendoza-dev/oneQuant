@@ -1,7 +1,7 @@
 """oneQuant v0.1 — data pipeline entry point.
 
 Starts all data feeds concurrently:
-  - Kraken WebSocket v2 (real-time BTC/USD candles)
+  - Binance.US WebSocket (real-time BTCUSD 5m + 15m candles)
   - Crypto news headline poller (every 15 minutes)
   - Fear & Greed Index poller (every 15 minutes)
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 from config import config
 from database.db import close_db, get_table_count, init_db, insert_system_log
-from feeds.kraken_ws import run_kraken_ws
+from feeds.binance_ws import run_binance_ws
 from feeds.news import run_fear_greed_poller, run_news_poller
 from paper_trading.paper_engine import run_paper_engine
 
@@ -27,7 +27,7 @@ from paper_trading.paper_engine import run_paper_engine
 # ---------------------------------------------------------------------------
 
 MODULE_NAME: str = "main"
-BANNER: str = "oneQuant v0.1 — data pipeline running"
+BANNER: str = "oneQuant v0.1 — data pipeline running (Binance.US)"
 TABLES: list[str] = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"]
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ async def main() -> None:
     await insert_system_log(MODULE_NAME, "INFO", "Data pipeline started")
 
     tasks = [
-        asyncio.create_task(run_kraken_ws(), name="kraken_ws"),
+        asyncio.create_task(run_binance_ws(), name="binance_ws"),
         asyncio.create_task(run_news_poller(), name="crypto_news"),
         asyncio.create_task(run_fear_greed_poller(), name="fear_greed"),
         asyncio.create_task(run_paper_engine(), name="paper_engine"),

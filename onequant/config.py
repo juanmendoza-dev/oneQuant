@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 REQUIRED_VARS: list[str] = [
-    "KRAKEN_API_KEY",
-    "KRAKEN_API_SECRET",
+    "BINANCE_API_KEY",
+    "BINANCE_API_SECRET",
 ]
 
 
@@ -18,10 +18,17 @@ REQUIRED_VARS: list[str] = [
 class Config:
     """Application configuration loaded from environment variables."""
 
-    KRAKEN_API_KEY: str
-    KRAKEN_API_SECRET: str
+    BINANCE_API_KEY: str
+    BINANCE_API_SECRET: str
     DATABASE_PATH: str
     LOG_LEVEL: str
+
+    # Exchange settings
+    EXCHANGE: str = "binance_us"
+    BASE_CURRENCY: str = "BTCUSD"
+    MAKER_FEE: float = 0.0000       # Binance.US Tier 0: 0% maker
+    TAKER_FEE: float = 0.000095     # Binance.US: 0.0095% taker
+    ORDER_TYPE: str = "LIMIT"        # NEVER market orders
 
 
 def load_config() -> Config:
@@ -37,8 +44,8 @@ def load_config() -> Config:
         sys.exit(1)
 
     return Config(
-        KRAKEN_API_KEY=os.environ["KRAKEN_API_KEY"],
-        KRAKEN_API_SECRET=os.environ["KRAKEN_API_SECRET"],
+        BINANCE_API_KEY=os.environ["BINANCE_API_KEY"],
+        BINANCE_API_SECRET=os.environ["BINANCE_API_SECRET"],
         DATABASE_PATH=os.getenv("DATABASE_PATH", "./onequant.db"),
         LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO"),
     )
