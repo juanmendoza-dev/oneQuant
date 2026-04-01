@@ -35,6 +35,7 @@ BACKTEST_PREDICTED_WR = 76.8
 
 STRATEGY_COLORS = {
     "mean_reversion": "#9b59b6",
+    "market_maker": "#f39c12",
     "capitulation": "#e67e22",
     "ema_pullback": "#06b6d4",
     "momentum": "#eab308",
@@ -42,6 +43,21 @@ STRATEGY_COLORS = {
     "news_driven": "#ec4899",
     "rsi_divergence": "#ef4444",
     "trend_exhaustion": "#3b82f6",
+}
+
+STRATEGY_TYPES = {
+    "market_maker": "market_maker",
+}
+
+STRATEGY_BADGES = {
+    "market_maker": "MM",
+    "mean_reversion": "MR",
+}
+
+# Paper trading graduation requirements
+GRADUATION_REQS = {
+    "market_maker": {"min_days": 7, "min_trades": 50, "predicted_wr": None},
+    "mean_reversion": {"min_days": 14, "min_trades": 50, "predicted_wr": BACKTEST_PREDICTED_WR},
 }
 
 
@@ -276,18 +292,14 @@ def paper_race(timeframe: str = Query(default="15m")):
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
-    finally:
-        conn.close()
 
     # Check for open positions
     open_positions = set()
     try:
-        conn2 = get_db()
-        open_rows = conn2.execute(
+        open_rows = conn.execute(
             "SELECT DISTINCT strategy FROM paper_trades WHERE status = 'OPEN'"
         ).fetchall()
         open_positions = {r["strategy"] for r in open_rows}
-        conn2.close()
     except Exception:
         pass
 
@@ -299,8 +311,9 @@ def paper_race(timeframe: str = Query(default="15m")):
             by_strategy[s] = []
         by_strategy[s].append(dict(r))
 
-    # All known strategies (even those with no trades yet)
+    # All known directional strategies
     all_strats = set(STRATEGY_COLORS.keys()) | set(by_strategy.keys())
+    all_strats.discard("market_maker")  # handled separately
 
     strategies = []
     for name in sorted(all_strats):
@@ -310,6 +323,7 @@ def paper_race(timeframe: str = Query(default="15m")):
         trades = []
         wins = 0
         closed = 0
+        first_trade_time = None
         for t in trades_raw:
             if t["status"] in ("WIN", "LOSS"):
                 pnl = t["pnl"] or 0.0
@@ -317,10 +331,11 @@ def paper_race(timeframe: str = Query(default="15m")):
                 closed += 1
                 if t["status"] == "WIN":
                     wins += 1
+                trade_time = t["exit_time"] or t["signal_time"]
+                if first_trade_time is None:
+                    first_trade_time = trade_time
                 trades.append({
-                    "time": datetime.fromtimestamp(
-                        t["exit_time"] or t["signal_time"], tz=timezone.utc
-                    ).isoformat(),
+                    "time": datetime.fromtimestamp(trade_time, tz=timezone.utc).isoformat(),
                     "pnl": round(pnl, 2),
                     "cumulative_pnl": round(cumulative, 2),
                     "result": t["status"],
@@ -329,17 +344,104 @@ def paper_race(timeframe: str = Query(default="15m")):
                 })
 
         wr = round((wins / closed) * 100, 2) if closed > 0 else 0.0
+        reqs = GRADUATION_REQS.get(name, {"min_days": 14, "min_trades": 50, "predicted_wr": BACKTEST_PREDICTED_WR})
+        days_running = 0
+        if first_trade_time:
+            days_running = (datetime.now(timezone.utc) - datetime.fromtimestamp(first_trade_time, tz=timezone.utc)).days
+
         strategies.append({
             "name": name,
             "color": color,
+            "type": STRATEGY_TYPES.get(name, "directional"),
+            "badge": STRATEGY_BADGES.get(name, name[:2].upper()),
+            "mode": "PAPER",
             "trades": trades,
             "current_pnl": round(cumulative, 2),
             "win_rate": wr,
-            "predicted_wr": BACKTEST_PREDICTED_WR,
-            "is_beating_prediction": wr >= BACKTEST_PREDICTED_WR if closed > 0 else False,
+            "total_trades": closed,
+            "predicted_wr": reqs["predicted_wr"],
+            "is_beating_prediction": wr >= reqs["predicted_wr"] if closed > 0 and reqs["predicted_wr"] else None,
             "open_position": name in open_positions,
+            "days_in_paper": days_running,
+            "graduation": {
+                "min_days": reqs["min_days"],
+                "min_trades": reqs["min_trades"],
+                "days_progress": min(days_running / reqs["min_days"], 1.0) if reqs["min_days"] else 0,
+                "trades_progress": min(closed / reqs["min_trades"], 1.0) if reqs["min_trades"] else 0,
+            },
         })
 
+    # --- Market Maker ---
+    mm_trades = []
+    mm_cumulative = 0.0
+    mm_round_trips = 0
+    mm_first_time = None
+    try:
+        mm_rows = conn.execute(
+            "SELECT timestamp, spread_collected_usd, price "
+            "FROM market_maker_trades "
+            "WHERE status = 'FILLED' AND spread_collected_usd > 0 AND paper_trade = 1 "
+            "ORDER BY timestamp ASC"
+        ).fetchall()
+        for r in mm_rows:
+            spread = r["spread_collected_usd"] or 0.0
+            mm_cumulative += spread
+            mm_round_trips += 1
+            ts = r["timestamp"]
+            if mm_first_time is None:
+                mm_first_time = ts
+            mm_trades.append({
+                "time": ts,
+                "pnl": round(spread, 4),
+                "cumulative_pnl": round(mm_cumulative, 4),
+                "result": "ROUND_TRIP",
+            })
+    except sqlite3.OperationalError:
+        pass
+
+    mm_days = 0
+    if mm_first_time:
+        try:
+            ft = datetime.fromisoformat(mm_first_time.replace("Z", "+00:00"))
+            mm_days = (datetime.now(timezone.utc) - ft).days
+        except Exception:
+            pass
+    # If no trades yet, count from first MM trade record of any kind
+    if mm_days == 0:
+        try:
+            first_row = conn.execute(
+                "SELECT timestamp FROM market_maker_trades ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if first_row and first_row["timestamp"]:
+                ft = datetime.fromisoformat(first_row["timestamp"].replace("Z", "+00:00"))
+                mm_days = max((datetime.now(timezone.utc) - ft).days, 0)
+        except Exception:
+            pass
+
+    mm_reqs = GRADUATION_REQS["market_maker"]
+    strategies.append({
+        "name": "market_maker",
+        "color": "#f39c12",
+        "type": "market_maker",
+        "badge": "MM",
+        "mode": "PAPER",
+        "trades": mm_trades,
+        "current_pnl": round(mm_cumulative, 4),
+        "win_rate": round((mm_round_trips / max(mm_round_trips, 1)) * 100, 2) if mm_round_trips > 0 else 0.0,
+        "total_trades": mm_round_trips,
+        "predicted_wr": None,
+        "is_beating_prediction": None,
+        "open_position": True,
+        "days_in_paper": mm_days,
+        "graduation": {
+            "min_days": mm_reqs["min_days"],
+            "min_trades": mm_reqs["min_trades"],
+            "days_progress": min(mm_days / mm_reqs["min_days"], 1.0),
+            "trades_progress": min(mm_round_trips / mm_reqs["min_trades"], 1.0),
+        },
+    })
+
+    conn.close()
     return {"strategies": strategies}
 
 
