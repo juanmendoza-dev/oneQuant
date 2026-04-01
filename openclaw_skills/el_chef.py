@@ -119,43 +119,68 @@ def read_results_context() -> str:
 # Anthropic API calls
 # ---------------------------------------------------------------------------
 
+def read_mean_reversion_context() -> str:
+    """Read mean_reversion.py to understand what a passing strategy looks like."""
+    mr_path = STRATEGIES_DIR / "mean_reversion.py"
+    if mr_path.exists():
+        return mr_path.read_text(encoding="utf-8")
+    return "Mean reversion strategy file not found."
+
+
 def call_sonnet_for_concept(rejected_md: str, results_context: str) -> str:
     """Call claude-sonnet-4-6 to propose ONE new strategy concept (text only)."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    mean_reversion_code = read_mean_reversion_context()
 
     prompt = f"""You are a quant strategy researcher for a Bitcoin trading bot.
 
-REJECTED STRATEGIES (do not repeat or closely resemble these):
+REJECTED STRATEGIES — study the failure patterns carefully:
 ---
 {rejected_md}
 ---
 
-PREVIOUS CANDIDATE RESULTS (also do not repeat strategies that already failed):
+KEY PATTERNS FROM REJECTIONS:
+- RANGING regime dominates 98%+ of trades and destroys all strategies that don't filter it
+- High-frequency signals (>5/week) on 15m candles are almost always noise
+- Volume-based filters (2x avg) select exhaustion candles, not continuation
+- EMA crossovers, RSI extremes alone, and VWAP deviation are insufficient edges
+- Strategies with WR < 55% need TP:SL > 2:1 but then fire too rarely
+
+WORKING STRATEGY (Mean Reversion Config A — study what it does RIGHT):
+---
+{mean_reversion_code}
+---
+Why it works: SELL-only in BULL_TREND regime, fires 2-5x/week, RSI > 75 + EMA
+deviation > 1.5% catches genuine overbought extensions, volume confirmation. WR 76.8%,
+PF 1.47, MaxDD -2.5%. The regime filter is the critical ingredient.
+
+PREVIOUS CANDIDATE RESULTS:
 ---
 {results_context}
 ---
 
 Suggest ONE new trading strategy concept for 15-minute BTC-USD candles.
 
-Requirements:
-- Must have positive expected value BEFORE costs: (WR × TP%) − ((1−WR) × SL%) > 0.55% fee drag
-- Must be implementable using only: timestamp, open, high, low, close, volume per candle
-- No external data sources (no news, no fear/greed index, no on-chain data)
-- Must be distinct from: Donchian Breakout, VWAP Momentum, Bollinger Band Reversion,
-  RSI+EMA Mean Reversion, RSI+MACD Momentum, and any strategy listed above
+CRITICAL REQUIREMENTS:
+- MUST include a regime filter (BULL_TREND, BEAR_TREND, or both) — NEVER trade RANGING
+- Target 2-5 signals per week (not 20+, not 0.5)
+- Must use LIMIT orders only (0% maker fee on Binance.US)
+- EV math: (WR × TP%) − ((1−WR) × SL%) > 0.1% (slippage + spread)
+- Only OHLCV data: timestamp, open, high, low, close, volume
+- Must be distinct from all rejected strategies AND mean reversion
 
-In your response describe:
-1. The core signal logic (entry condition)
-2. Regime filter (if any)
-3. Expected win rate and mathematical justification
-4. Suggested SL% and TP% and the EV calculation showing positive expectancy
-5. Why this specific market microstructure edge exists in 15m BTC-USD data
+Describe:
+1. Core signal logic (entry conditions — be specific)
+2. Regime filter (which regime and how detected)
+3. Expected WR with mathematical justification
+4. SL% and TP% with EV calculation
+5. Why this edge exists in 15m BTC specifically
 
-Respond with text only — no Python code, no markdown code blocks."""
+Text only — no Python code, no markdown code blocks."""
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
@@ -284,6 +309,7 @@ def run_candidate_backtest(StrategyClass: type):
         take_profit_pct=0.04,
         min_confidence=0.55,
         order_type="limit",
+        symbol="BTCUSD",
     )
     result = run_backtest(cfg)
     metrics = calculate_metrics(result)
@@ -395,7 +421,11 @@ def main() -> None:
     write_rate_limit()
     print("[el_chef] Rate limit updated.")
 
-    # 7. Parse class and strategy name
+    # 7. Strip markdown fences if present
+    code = re.sub(r'^```(?:python)?\s*\n', '', code)
+    code = re.sub(r'\n```\s*$', '', code)
+
+    # Parse class and strategy name
     try:
         class_name = extract_class_name(code)
     except ValueError as e:

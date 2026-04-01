@@ -1,0 +1,12 @@
+{
+  "strategy_name": "Trend Pullback to Dynamic EMA Support",
+  "slug": "trend_pullback_to_dynamic_ema_support",
+  "timestamp": "2026-04-01T20:09:56.159779+00:00",
+  "verdict": "PASS",
+  "win_rate_pct": 60.17,
+  "profit_factor": 1.006,
+  "max_drawdown_pct": 12.5,
+  "total_trades": 344,
+  "total_pnl": 1.28,
+  "failure_reason": null
+}

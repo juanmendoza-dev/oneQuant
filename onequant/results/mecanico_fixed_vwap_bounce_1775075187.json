@@ -1,0 +1,13 @@
+{
+  "strategy_name": "fixed_vwap_bounce",
+  "slug": "fixed_vwap_bounce",
+  "timestamp": "2026-04-01T20:26:27.109930+00:00",
+  "source": "el_mecanico",
+  "verdict": "FAIL",
+  "win_rate_pct": 57.14,
+  "profit_factor": 0.883,
+  "max_drawdown_pct": 2.0,
+  "total_trades": 28,
+  "total_pnl": -2.11,
+  "failure_reason": "PF 0.883 < 1.0"
+}

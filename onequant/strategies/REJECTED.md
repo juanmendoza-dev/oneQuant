@@ -418,3 +418,86 @@ shows BULL_TREND WR 92% / PF 5.05 (13 trades) and BEAR_TREND WR 75%
 sizes are too small to validate. RANGING (519 trades, WR 54%,
 PF 0.53) destroys overall performance. The 6-candle run condition
 in ranging markets catches normal oscillations, not true exhaustion.
+
+---
+
+## VWAP Reversion (5m)
+
+**File:** `strategies/vwap_reversion.py` (deleted)
+**Tested:** 2026-04-01
+**Timeframe:** 5m candles, $75 capital, 0% maker fees
+**Verdict:** REJECTED — WR 36.0% < 52%; PF 0.78 < 1.0; MaxDD 61.8% > 25%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 8,121 | 36.0% | 0.78 | -61.8% | -$46.02 |
+
+Mean reversion to daily VWAP with RSI oversold/overbought and volume
+confirmation. 8,105 of 8,121 trades in RANGING regime (WR 36%, PF 0.78).
+The 0.8% VWAP deviation threshold fires far too often on 5m candles —
+price oscillates around VWAP continuously in ranging conditions. Slippage
+($11.60) and spread ($3.87) totaled $15.47 on $75 capital despite 0% fees.
+The RSI 35/65 filters are too loose to identify genuine mean-reversion setups.
+
+---
+
+## Opening Range Breakout (5m)
+
+**File:** `strategies/opening_range.py` (deleted)
+**Tested:** 2026-04-01
+**Timeframe:** 5m candles, $75 capital, 0% maker fees
+**Verdict:** REJECTED — WR 39.7% < 52%; PF 0.87 < 1.0
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 237 | 39.7% | 0.87 | -4.0% | -$2.09 |
+
+UTC midnight opening range (first 30min) breakout on 5m candles. All 237
+trades in RANGING regime. Low drawdown (-4.0%) and low trade count
+suggest the time window filter (00:30–04:00 UTC) and range width filter
+(0.3%–2.0%) are working, but breakout direction is still a coin flip at
+39.7% WR. Crypto has no true "opening" — UTC midnight is arbitrary and
+does not produce the same range-setting behavior as equity market opens.
+Previously rejected on 15m (WR 46.6%); 5m version is even worse.
+
+---
+
+## Volume Profile Scalp (5m)
+
+**File:** `strategies/volume_profile_scalp.py` (deleted)
+**Tested:** 2026-04-01
+**Timeframe:** 5m candles, $75 capital, 0% maker fees
+**Verdict:** REJECTED — WR 35.3% < 52%; PF 0.84 < 1.0; MaxDD 30.9% > 25%
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 6,915 | 35.3% | 0.84 | -30.9% | -$23.10 |
+
+Volume profile POC/HVN scalping on 5m candles. 6,899 of 6,915 trades in
+RANGING. The 0.2% proximity threshold with a 100-candle lookback creates
+an almost continuous set of "key levels" — price is nearly always near
+some HVN. The reversal candle pattern (previous candle opposite color +
+current candle confirms) is too common on 5m timeframe to have predictive
+power. Slippage + spread: $16.77 on $75 capital.
+
+---
+
+## Momentum Continuation (5m)
+
+**File:** `strategies/momentum_continuation.py` (deleted)
+**Tested:** 2026-04-01
+**Timeframe:** 5m candles, $75 capital, 0% maker fees
+**Verdict:** REJECTED — WR 30.5% < 52%; PF 0.85 < 1.0
+
+| Trades | WR | PF | MaxDD | P&L |
+|---|---|---|---|---|
+| 2,249 | 30.5% | 0.85 | -14.7% | -$10.57 |
+
+Momentum continuation after strong candles (body > 0.3%, > 70% range,
+2x volume) on 5m. The 2:1 TP:SL ratio (1.2% TP / 0.6% SL) requires only
+33% WR to break even on gross, but WR was 30.5% — even the favorable
+asymmetry could not overcome. 2,244 of 2,249 trades in RANGING where
+momentum candles are noise, not signal. The 0.3% body threshold is too
+low for 5m BTC candles, firing ~7 times/week into random volatility.
+S/R proximity check (last 20 candle highs/lows) did not meaningfully
+filter because price always has nearby levels on 5m timeframe.
