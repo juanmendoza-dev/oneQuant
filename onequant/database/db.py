@@ -1,6 +1,7 @@
 """SQLite database setup, table creation, and insert helpers."""
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -81,6 +82,35 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     created_at INTEGER NOT NULL
 )"""
 
+CREATE_MM_TRADES: str = """
+CREATE TABLE IF NOT EXISTS market_maker_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price REAL NOT NULL,
+    quantity_btc REAL NOT NULL,
+    value_usd REAL NOT NULL,
+    fee_usd REAL NOT NULL,
+    order_id TEXT,
+    status TEXT NOT NULL,
+    paper_trade INTEGER DEFAULT 1,
+    spread_collected_usd REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+)"""
+
+CREATE_MM_STATS: str = """
+CREATE TABLE IF NOT EXISTS market_maker_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    total_round_trips INTEGER DEFAULT 0,
+    total_spread_collected REAL DEFAULT 0.0,
+    total_fees_paid REAL DEFAULT 0.0,
+    avg_spread_pct REAL DEFAULT 0.0,
+    best_spread_usd REAL DEFAULT 0.0,
+    paper_trade INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT (datetime('now'))
+)"""
+
 CREATE_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_candles_symbol ON btc_candles(symbol)",
     "CREATE INDEX IF NOT EXISTS idx_candles_ts ON btc_candles(timestamp)",
@@ -91,6 +121,9 @@ CREATE_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_syslog_ts ON system_log(timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status)",
     "CREATE INDEX IF NOT EXISTS idx_paper_ts ON paper_trades(signal_time)",
+    "CREATE INDEX IF NOT EXISTS idx_mm_trades_ts ON market_maker_trades(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_mm_trades_status ON market_maker_trades(status)",
+    "CREATE INDEX IF NOT EXISTS idx_mm_stats_date ON market_maker_stats(date)",
 ]
 
 # ---------------------------------------------------------------------------
@@ -112,6 +145,8 @@ async def init_db() -> None:
     await _conn.execute(CREATE_FEAR_GREED)
     await _conn.execute(CREATE_SYSTEM_LOG)
     await _conn.execute(CREATE_PAPER_TRADES)
+    await _conn.execute(CREATE_MM_TRADES)
+    await _conn.execute(CREATE_MM_STATS)
     for idx_sql in CREATE_INDEXES:
         await _conn.execute(idx_sql)
     await _conn.commit()
@@ -227,7 +262,8 @@ async def insert_system_log(module: str, level: str, message: str) -> None:
 
 async def get_table_count(table: str) -> int:
     """Get the row count for a given table."""
-    allowed = {"btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"}
+    allowed = {"btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades",
+                "market_maker_trades", "market_maker_stats"}
     if table not in allowed:
         raise ValueError(f"Unknown table: {table}")
     conn = _get_conn()
@@ -440,4 +476,92 @@ async def get_paper_stats() -> dict:
         "profit_factor": round(profit_factor, 3),
         "backtest_predicted_wr": 76.8,
         "divergence_pct": round(divergence_pct, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Market maker helpers
+# ---------------------------------------------------------------------------
+
+
+async def insert_mm_trade(
+    timestamp: str,
+    side: str,
+    price: float,
+    quantity_btc: float,
+    value_usd: float,
+    fee_usd: float,
+    order_id: str,
+    status: str,
+    paper_trade: bool,
+    spread_collected_usd: float = 0.0,
+) -> int:
+    """Insert a market maker trade record. Returns the row id."""
+    conn = _get_conn()
+    cursor = await conn.execute(
+        """INSERT INTO market_maker_trades
+           (timestamp, side, price, quantity_btc, value_usd, fee_usd,
+            order_id, status, paper_trade, spread_collected_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (timestamp, side, price, quantity_btc, value_usd, fee_usd,
+         order_id, status, 1 if paper_trade else 0, spread_collected_usd),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def insert_mm_daily_stats(
+    date: str,
+    total_round_trips: int,
+    total_spread_collected: float,
+    total_fees_paid: float,
+    avg_spread_pct: float,
+    best_spread_usd: float,
+    paper_trade: bool,
+) -> None:
+    """Insert or update daily market maker stats."""
+    conn = _get_conn()
+    await conn.execute(
+        """INSERT INTO market_maker_stats
+           (date, total_round_trips, total_spread_collected, total_fees_paid,
+            avg_spread_pct, best_spread_usd, paper_trade)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (date, total_round_trips, total_spread_collected, total_fees_paid,
+         avg_spread_pct, best_spread_usd, 1 if paper_trade else 0),
+    )
+    await conn.commit()
+
+
+async def get_mm_trades(limit: int = 50) -> list[dict]:
+    """Return the most recent market maker trades."""
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM market_maker_trades ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in rows]
+
+
+async def get_mm_stats_today() -> dict:
+    """Aggregate market maker stats for today."""
+    conn = _get_conn()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d") if True else ""
+    cursor = await conn.execute(
+        """SELECT
+               COUNT(*) AS total_fills,
+               SUM(CASE WHEN spread_collected_usd > 0 THEN 1 ELSE 0 END) AS round_trips,
+               COALESCE(SUM(spread_collected_usd), 0.0) AS spread_collected
+           FROM market_maker_trades
+           WHERE timestamp LIKE ? AND status = 'FILLED'""",
+        (today + "%",),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return {"total_fills": 0, "round_trips": 0, "spread_collected": 0.0}
+    return {
+        "total_fills": row[0] or 0,
+        "round_trips": row[1] or 0,
+        "spread_collected": round(row[2] or 0.0, 4),
     }

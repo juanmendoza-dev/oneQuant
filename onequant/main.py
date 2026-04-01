@@ -25,6 +25,7 @@ from pathlib import Path
 
 from config import config
 from database.db import close_db, get_table_count, init_db, insert_system_log
+from feeds.binance_rest import get_ticker
 from feeds.binance_ws import run_binance_ws
 from feeds.news import run_fear_greed_poller, run_news_poller
 from paper_trading.paper_engine import run_paper_engine
@@ -33,6 +34,7 @@ from safety.circuit_breaker import CircuitBreaker
 from safety.fee_monitor import FeeMonitor
 from safety.order_validator import OrderValidator
 from safety.position_sizer import PositionSizer
+from strategies.market_maker import MarketMakerStrategy
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -40,7 +42,8 @@ from safety.position_sizer import PositionSizer
 
 MODULE_NAME: str = "main"
 BANNER: str = "oneQuant v0.2 — data pipeline running (Binance.US)"
-TABLES: list[str] = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"]
+TABLES: list[str] = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades",
+                      "market_maker_trades", "market_maker_stats"]
 ACCOUNT_BALANCE: float = 300.0  # approximate starting capital
 
 # ---------------------------------------------------------------------------
@@ -51,28 +54,80 @@ logger: logging.Logger = logging.getLogger(MODULE_NAME)
 
 
 def _setup_logging() -> None:
-    """Configure file and console logging for the main module."""
+    """Configure file and console logging for the main module and market maker."""
     if logger.handlers:
         return
     logger.setLevel(logging.DEBUG)
     Path("logs").mkdir(exist_ok=True)
 
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
+
     fh = logging.FileHandler("logs/main.log")
     fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
 
     ch = logging.StreamHandler()
     ch.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
-
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
-    fh.setFormatter(fmt)
     ch.setFormatter(fmt)
+
     logger.addHandler(fh)
     logger.addHandler(ch)
+
+    # Also configure market maker and safety loggers so they output to console/file
+    for name in ("strategies.market_maker", "circuit_breaker", "order_validator"):
+        sub = logging.getLogger(name)
+        sub.setLevel(logging.DEBUG)
+        sub.addHandler(fh)
+        sub.addHandler(ch)
 
 
 # ---------------------------------------------------------------------------
 # Startup helpers
 # ---------------------------------------------------------------------------
+
+
+async def run_market_maker(circuit_breaker: CircuitBreaker, order_validator: OrderValidator) -> None:
+    """Run the market maker strategy in a loop."""
+    mm = MarketMakerStrategy(
+        capital_usd=config.MM_CAPITAL_USD,
+        spread_pct=config.MM_SPREAD_PCT,
+        paper_trading=config.MM_PAPER_TRADING,
+        circuit_breaker=circuit_breaker,
+        order_validator=order_validator,
+    )
+
+    await insert_system_log(MODULE_NAME, "INFO", "Market maker started")
+    logger.info("Market maker task started — %s mode", "PAPER" if config.MM_PAPER_TRADING else "LIVE")
+
+    cycle_count = 0
+    while True:
+        try:
+            price = await get_ticker()
+            if price is None:
+                logger.warning("Market maker: failed to get price, skipping cycle")
+                await asyncio.sleep(config.MM_ORDER_REFRESH_SEC)
+                continue
+
+            await mm.run_cycle(price)
+            cycle_count += 1
+
+            # Log status every 10 minutes (20 cycles at 30s)
+            if cycle_count % 20 == 0:
+                status = mm.get_status()
+                logger.info(
+                    "MM Status: %d round trips, $%.4f spread collected, "
+                    "BTC inventory: %.6f, USD: $%.2f",
+                    status["total_round_trips"],
+                    status["total_spread_collected"],
+                    status["btc_inventory"],
+                    status["usd_inventory"],
+                )
+
+        except Exception as exc:
+            logger.error("Market maker cycle error: %s", exc)
+            await insert_system_log(MODULE_NAME, "ERROR", f"Market maker error: {exc}")
+
+        await asyncio.sleep(config.MM_ORDER_REFRESH_SEC)
 
 
 async def _print_table_counts() -> None:
@@ -144,6 +199,7 @@ async def main() -> None:
         asyncio.create_task(run_news_poller(), name="crypto_news"),
         asyncio.create_task(run_fear_greed_poller(), name="fear_greed"),
         asyncio.create_task(run_paper_engine(), name="paper_engine"),
+        asyncio.create_task(run_market_maker(circuit_breaker, order_validator), name="market_maker"),
     ]
 
     # Graceful shutdown on SIGINT / SIGTERM

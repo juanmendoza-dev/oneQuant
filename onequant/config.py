@@ -30,6 +30,14 @@ class Config:
     TAKER_FEE: float = 0.000095     # Binance.US: 0.0095% taker
     ORDER_TYPE: str = "LIMIT"        # NEVER market orders
 
+    # Market Maker Settings
+    MM_CAPITAL_USD: float = 75.0
+    MM_SPREAD_PCT: float = 0.0015      # 0.15% spread each side
+    MM_ORDER_REFRESH_SEC: int = 30     # refresh orders every 30s
+    MM_MAX_INVENTORY_PCT: float = 0.8  # max 80% BTC inventory
+    MM_MIN_SPREAD_PCT: float = 0.0008  # min spread to place orders
+    MM_PAPER_TRADING: bool = True      # start in paper mode
+
 
 def load_config() -> Config:
     """Load and validate configuration from environment variables.

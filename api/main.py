@@ -68,7 +68,8 @@ def _service_active(name: str) -> bool:
 
 
 def _db_counts() -> list[dict]:
-    tables = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades"]
+    tables = ["btc_candles", "news_feed", "fear_greed", "system_log", "paper_trades",
+              "market_maker_trades", "market_maker_stats"]
     results = []
     try:
         conn = get_db()
@@ -362,5 +363,91 @@ def system_logs(limit: int = Query(default=50, le=500)):
         return results
     except sqlite3.OperationalError:
         return []
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/market-maker
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/market-maker")
+def market_maker():
+    conn = get_db()
+    try:
+        # Total stats
+        row = conn.execute(
+            """SELECT
+                   COUNT(*) AS total_round_trips,
+                   COALESCE(SUM(spread_collected_usd), 0.0) AS total_spread
+               FROM market_maker_trades
+               WHERE status = 'FILLED' AND spread_collected_usd > 0"""
+        ).fetchone()
+        total_round_trips = row["total_round_trips"] if row else 0
+        total_spread = row["total_spread"] if row else 0.0
+
+        # Today's stats
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day_row = conn.execute(
+            """SELECT
+                   COUNT(*) AS rt,
+                   COALESCE(SUM(spread_collected_usd), 0.0) AS spread
+               FROM market_maker_trades
+               WHERE status = 'FILLED' AND spread_collected_usd > 0
+                 AND timestamp LIKE ?""",
+            (today + "%",),
+        ).fetchone()
+        daily_rt = day_row["rt"] if day_row else 0
+        daily_spread = day_row["spread"] if day_row else 0.0
+
+        # This week's stats (last 7 days)
+        week_row = conn.execute(
+            """SELECT
+                   COALESCE(SUM(spread_collected_usd), 0.0) AS spread
+               FROM market_maker_trades
+               WHERE status = 'FILLED' AND spread_collected_usd > 0
+                 AND timestamp >= datetime('now', '-7 days')"""
+        ).fetchone()
+        weekly_spread = week_row["spread"] if week_row else 0.0
+
+        # Latest price from a recent trade
+        price_row = conn.execute(
+            "SELECT price FROM market_maker_trades ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        last_price = price_row["price"] if price_row else 0.0
+
+        return {
+            "mode": "PAPER",
+            "capital_usd": 75.0,
+            "total_round_trips": total_round_trips,
+            "total_spread_collected": round(total_spread, 4),
+            "daily_round_trips": daily_rt,
+            "daily_spread_collected": round(daily_spread, 4),
+            "weekly_spread_collected": round(weekly_spread, 4),
+            "btc_inventory": 0.0,
+            "usd_inventory": 75.0,
+            "active_buy_price": None,
+            "active_sell_price": None,
+            "last_price": last_price,
+            "status": "RUNNING",
+        }
+
+    except sqlite3.OperationalError:
+        return {
+            "mode": "PAPER",
+            "capital_usd": 75.0,
+            "total_round_trips": 0,
+            "total_spread_collected": 0.0,
+            "daily_round_trips": 0,
+            "daily_spread_collected": 0.0,
+            "weekly_spread_collected": 0.0,
+            "btc_inventory": 0.0,
+            "usd_inventory": 75.0,
+            "active_buy_price": None,
+            "active_sell_price": None,
+            "last_price": 0.0,
+            "status": "RUNNING",
+        }
     finally:
         conn.close()
