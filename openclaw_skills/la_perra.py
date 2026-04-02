@@ -4,16 +4,21 @@ Runs 6 engine integrity tests, verifies SHA256 of engine.py, queries paper
 trade win rate, calls Claude Haiku to analyze for suspicious patterns, and
 sends a morning summary to Telegram.
 
+Includes hardware monitoring (CPU temp, memory, disk), daily cost tracking
+(API + electricity), and weekly/monthly cost summaries.
+
 All API keys loaded from onequant/.env only.
 """
 
+import calendar
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
@@ -57,6 +62,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+# Electricity constants (FPL Pembroke Pines, FL — Tier 2)
+SERVER_WATTAGE = 70    # estimated continuous watts
+FPL_RATE = 0.146       # $/kWh tier 2
+
+# Estimated API costs per run
+API_COSTS = {
+    "el_chef": 0.38,       # Sonnet + Opus per run
+    "el_mecanico": 0.14,   # Sonnet + Opus per run
+    "la_perra": 0.003,     # Haiku per run
+}
 
 
 # ---------------------------------------------------------------------------
@@ -224,17 +240,333 @@ Respond with exactly one line:
 
 
 # ---------------------------------------------------------------------------
-# Telegram
+# Hardware monitoring
 # ---------------------------------------------------------------------------
 
-def format_telegram_message(findings: dict, claude_analysis: str, run_time: datetime) -> str:
-    """Format the morning summary as an HTML Telegram message."""
+def get_hardware_stats() -> dict:
+    """Collect hardware stats: CPU temp, memory, DB size, disk usage."""
+    # CPU temperature from thermal zones
+    cpu_temp = None
+    try:
+        temps = []
+        thermal_base = Path("/sys/class/thermal")
+        for zone in sorted(thermal_base.glob("thermal_zone*")):
+            temp_file = zone / "temp"
+            if temp_file.exists():
+                raw = temp_file.read_text().strip()
+                temps.append(int(raw) / 1000.0)
+        if temps:
+            cpu_temp = sum(temps) / len(temps)
+    except (OSError, ValueError):
+        pass
+
+    # Memory usage
+    memory_pct = None
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        mem_total = mem_avail = None
+        for line in meminfo.splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                mem_avail = int(line.split()[1])
+        if mem_total and mem_avail:
+            memory_pct = (mem_total - mem_avail) / mem_total * 100.0
+    except (OSError, ValueError):
+        pass
+
+    # DB size
+    db_size_mb = None
+    try:
+        if DB_PATH.exists():
+            db_size_mb = DB_PATH.stat().st_size / (1024 * 1024)
+    except OSError:
+        pass
+
+    # Disk usage
+    disk_usage_pct = None
+    try:
+        usage = shutil.disk_usage("/root")
+        disk_usage_pct = usage.used / usage.total * 100.0
+    except OSError:
+        pass
+
+    return {
+        "cpu_temp_c": round(cpu_temp, 1) if cpu_temp is not None else None,
+        "memory_pct": round(memory_pct, 1) if memory_pct is not None else None,
+        "db_size_mb": round(db_size_mb, 1) if db_size_mb is not None else None,
+        "disk_usage_pct": round(disk_usage_pct, 1) if disk_usage_pct is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cost calculations
+# ---------------------------------------------------------------------------
+
+def calculate_electricity_cost(hours: float = 24.0) -> dict:
+    """Calculate electricity cost for the given number of hours."""
+    kwh = (SERVER_WATTAGE * hours) / 1000.0
+    cost = kwh * FPL_RATE
+    return {"kwh": round(kwh, 3), "cost": round(cost, 4)}
+
+
+def calculate_api_costs() -> dict:
+    """Return estimated daily API costs."""
+    total = sum(API_COSTS.values())
+    return {
+        "el_chef": API_COSTS["el_chef"],
+        "el_mecanico": API_COSTS["el_mecanico"],
+        "la_perra": API_COSTS["la_perra"],
+        "total": round(total, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Daily costs database operations
+# ---------------------------------------------------------------------------
+
+def _ensure_daily_costs_table(conn: sqlite3.Connection) -> None:
+    """Create daily_costs table if it doesn't exist (for standalone usage)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL UNIQUE,
+            el_chef_cost REAL DEFAULT 0.0,
+            el_mecanico_cost REAL DEFAULT 0.0,
+            la_perra_cost REAL DEFAULT 0.0,
+            total_api_cost REAL DEFAULT 0.0,
+            electricity_kwh REAL DEFAULT 0.0,
+            electricity_cost REAL DEFAULT 0.0,
+            total_cost REAL DEFAULT 0.0,
+            avg_cpu_temp_c REAL DEFAULT 0.0,
+            peak_cpu_temp_c REAL DEFAULT 0.0,
+            avg_memory_pct REAL DEFAULT 0.0,
+            db_size_mb REAL DEFAULT 0.0,
+            candidates_generated INTEGER DEFAULT 0,
+            candidates_passed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
+
+def save_daily_costs(hw_stats: dict, api_costs: dict, elec: dict,
+                     candidates_generated: int = 0, candidates_passed: int = 0) -> None:
+    """Insert or replace today's cost record."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total_api = api_costs["total"]
+    total_cost = total_api + elec["cost"]
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_daily_costs_table(conn)
+        conn.execute("""
+            INSERT OR REPLACE INTO daily_costs
+                (date, el_chef_cost, el_mecanico_cost, la_perra_cost,
+                 total_api_cost, electricity_kwh, electricity_cost, total_cost,
+                 avg_cpu_temp_c, peak_cpu_temp_c, avg_memory_pct, db_size_mb,
+                 candidates_generated, candidates_passed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            today,
+            api_costs["el_chef"],
+            api_costs["el_mecanico"],
+            api_costs["la_perra"],
+            total_api,
+            elec["kwh"],
+            elec["cost"],
+            total_cost,
+            hw_stats.get("cpu_temp_c") or 0.0,
+            hw_stats.get("cpu_temp_c") or 0.0,  # peak = current for single reading
+            hw_stats.get("memory_pct") or 0.0,
+            hw_stats.get("db_size_mb") or 0.0,
+            candidates_generated,
+            candidates_passed,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_weekly_summary() -> dict:
+    """Query daily_costs for last 7 days."""
+    end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    start = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_daily_costs_table(conn)
+        row = conn.execute("""
+            SELECT
+                COALESCE(SUM(total_api_cost), 0.0),
+                COALESCE(SUM(electricity_cost), 0.0),
+                COALESCE(SUM(total_cost), 0.0),
+                COALESCE(AVG(avg_cpu_temp_c), 0.0),
+                COALESCE(MAX(peak_cpu_temp_c), 0.0),
+                COALESCE(SUM(electricity_kwh), 0.0),
+                COALESCE(SUM(candidates_generated), 0),
+                COALESCE(SUM(candidates_passed), 0),
+                COUNT(*)
+            FROM daily_costs
+            WHERE date BETWEEN ? AND ?
+        """, (start, end)).fetchone()
+    finally:
+        conn.close()
+
+    days = row[8] or 1
+    return {
+        "total_api_cost": round(row[0], 2),
+        "total_electricity_cost": round(row[1], 2),
+        "total_cost": round(row[2], 2),
+        "daily_avg_cost": round(row[2] / days, 2),
+        "avg_cpu_temp": round(row[3], 1),
+        "peak_cpu_temp": round(row[4], 1),
+        "total_kwh": round(row[5], 3),
+        "candidates_generated": row[6],
+        "candidates_passed": row[7],
+        "days_recorded": days,
+        "start_date": start,
+        "end_date": end,
+    }
+
+
+def get_monthly_summary() -> dict:
+    """Query daily_costs for the current calendar month."""
+    now = datetime.now(timezone.utc)
+    start = now.strftime("%Y-%m-01")
+    end = now.strftime("%Y-%m-%d")
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_daily_costs_table(conn)
+        row = conn.execute("""
+            SELECT
+                COALESCE(SUM(total_api_cost), 0.0),
+                COALESCE(SUM(electricity_cost), 0.0),
+                COALESCE(SUM(total_cost), 0.0),
+                COALESCE(SUM(el_chef_cost), 0.0),
+                COALESCE(SUM(el_mecanico_cost), 0.0),
+                COALESCE(SUM(la_perra_cost), 0.0),
+                COALESCE(AVG(avg_cpu_temp_c), 0.0),
+                COALESCE(MAX(peak_cpu_temp_c), 0.0),
+                COALESCE(SUM(electricity_kwh), 0.0),
+                COALESCE(SUM(candidates_generated), 0),
+                COALESCE(SUM(candidates_passed), 0),
+                COUNT(*),
+                COALESCE(SUM(db_size_mb), 0.0)
+            FROM daily_costs
+            WHERE date BETWEEN ? AND ?
+        """, (start, end)).fetchone()
+    finally:
+        conn.close()
+
+    days = row[11] or 1
+    total_cost = row[2]
+    daily_avg = total_cost / days
+    projected_annual = daily_avg * 365
+    candidates_passed = row[10]
+    cost_per_candidate = (total_cost / candidates_passed) if candidates_passed > 0 else 0.0
+
+    # DB growth: difference between latest and earliest db_size_mb
+    db_growth = 0.0
+    conn2 = sqlite3.connect(str(DB_PATH))
+    try:
+        growth_row = conn2.execute("""
+            SELECT
+                (SELECT db_size_mb FROM daily_costs WHERE date BETWEEN ? AND ? ORDER BY date DESC LIMIT 1) -
+                (SELECT db_size_mb FROM daily_costs WHERE date BETWEEN ? AND ? ORDER BY date ASC LIMIT 1)
+        """, (start, end, start, end)).fetchone()
+        if growth_row and growth_row[0]:
+            db_growth = max(0.0, growth_row[0])
+    finally:
+        conn2.close()
+
+    return {
+        "month_name": now.strftime("%B"),
+        "year": now.year,
+        "total_api_cost": round(row[0], 2),
+        "total_electricity_cost": round(row[1], 2),
+        "total_cost": round(total_cost, 2),
+        "el_chef_total": round(row[3], 2),
+        "el_mecanico_total": round(row[4], 2),
+        "la_perra_total": round(row[5], 2),
+        "avg_cpu_temp": round(row[6], 1),
+        "peak_cpu_temp": round(row[7], 1),
+        "total_kwh": round(row[8], 3),
+        "candidates_generated": row[9],
+        "candidates_passed": row[10],
+        "days_recorded": days,
+        "daily_avg_cost": round(daily_avg, 2),
+        "projected_annual": round(projected_annual, 2),
+        "cost_per_candidate": round(cost_per_candidate, 2),
+        "db_growth_mb": round(db_growth, 1),
+        "projected_db_annual_mb": round(db_growth / days * 365, 1) if days > 0 else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Market maker stats query
+# ---------------------------------------------------------------------------
+
+def query_mm_today() -> dict:
+    """Query market maker round trips for today."""
+    if not DB_PATH.exists():
+        return {"round_trips": 0, "spread_collected": 0.0}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        row = conn.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN spread_collected_usd > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(spread_collected_usd), 0.0)
+            FROM market_maker_trades
+            WHERE timestamp LIKE ? AND status = 'FILLED'
+        """, (today + "%",)).fetchone()
+    except sqlite3.OperationalError:
+        return {"round_trips": 0, "spread_collected": 0.0}
+    finally:
+        conn.close()
+    return {
+        "round_trips": row[0] if row else 0,
+        "spread_collected": round(row[1], 4) if row else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Telegram message formats
+# ---------------------------------------------------------------------------
+
+def _temp_indicator(temp_c) -> str:
+    """Return temperature status indicator."""
+    if temp_c is None:
+        return "N/A"
+    if temp_c < 70:
+        return f"{temp_c:.1f}°C ✓"
+    elif temp_c <= 80:
+        return f"{temp_c:.1f}°C ⚠️"
+    else:
+        return f"{temp_c:.1f}°C 🔴"
+
+
+def _fmt(val, fmt_str=".2f", suffix="", prefix="$", na="N/A"):
+    """Format a numeric value or return N/A."""
+    if val is None:
+        return na
+    return f"{prefix}{val:{fmt_str}}{suffix}"
+
+
+def format_telegram_message(findings: dict, claude_analysis: str, run_time: datetime,
+                            hw_stats: dict, api_costs: dict, elec: dict,
+                            mm_stats: dict) -> str:
+    """Format the daily summary as an HTML Telegram message."""
     date_str = run_time.strftime("%Y-%m-%d")
     time_str = run_time.strftime("%H:%M")
 
     audit_status = "PASSED" if findings["audit_passed"] else "FAILED"
     hash_status = findings["hash_status"]
 
+    # Trade stats block
     ts = findings["trade_stats"]
     if ts["db_status"] == "NO_DATABASE":
         trade_block = "  No database — paper trading not started yet."
@@ -243,40 +575,172 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
     elif ts["total_trades"] == 0:
         trade_block = "  No completed trades yet."
     else:
-        div = ts["divergence_pct"]
-        div_str = f"{div:+.1f}pp"
-        if abs(div) > 20:
-            div_str += " CRITICAL"
-        elif abs(div) > 10:
-            div_str += " WARNING"
         trade_block = (
-            f"  Trades: {ts['total_trades']}  "
-            f"(Wins: {ts['wins']} / Losses: {ts['losses']})\n"
-            f"  Actual WR:    {ts['actual_win_rate_pct']:.1f}%\n"
-            f"  Predicted WR: {ts['predicted_win_rate_pct']:.1f}%\n"
-            f"  Divergence:   {div_str}"
+            f"  Trades Today:    {ts['total_trades']}\n"
+            f"  Actual WR:       {ts['actual_win_rate_pct']:.1f}% (predicted {BACKTEST_PREDICTED_WR}%)\n"
+            f"  Market Maker:    {mm_stats['round_trips']} round trips"
         )
 
+    # Hardware block
+    temp_str = _temp_indicator(hw_stats.get("cpu_temp_c"))
+    mem_str = f"{hw_stats['memory_pct']:.1f}%" if hw_stats.get("memory_pct") is not None else "N/A"
+    db_str = f"{hw_stats['db_size_mb']:.1f}MB" if hw_stats.get("db_size_mb") is not None else "N/A"
+    disk_str = f"{hw_stats['disk_usage_pct']:.1f}%" if hw_stats.get("disk_usage_pct") is not None else "N/A"
+
+    # Cost block
+    total_api = api_costs["total"]
+    total_daily = total_api + elec["cost"]
+    monthly_proj = total_daily * 30
+
+    # Temperature alert
+    temp_alert = ""
+    cpu_temp = hw_stats.get("cpu_temp_c")
+    if cpu_temp is not None and cpu_temp > 80:
+        temp_alert = (
+            f"\n🔴 TEMPERATURE ALERT: CPU at {cpu_temp:.1f}°C\n"
+            f"Consider improving airflow or reducing load\n"
+        )
+
+    # Overall status
+    status = "CLEAN" if (findings["audit_passed"] and "CLEAN" in claude_analysis) else "ACTION REQUIRED"
+
     msg = (
-        f"<b>oneQuant Daily Audit</b> — {date_str}\n"
+        f"🐕 <b>oneQuant Daily Audit</b> — {date_str}\n"
         f"\n"
-        f"<b>Engine Audit:</b> {audit_status}\n"
-        f"<b>Engine Hash:</b> {hash_status}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>SYSTEM HEALTH</b>\n"
+        f"  Engine Audit:    {audit_status}\n"
+        f"  Engine Hash:     {hash_status}\n"
         f"\n"
-        f"<b>Paper Trading:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>PAPER TRADING</b>\n"
         f"{trade_block}\n"
         f"\n"
-        f"<b>AI Analysis:</b>\n"
-        f"{claude_analysis}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌡️ <b>HARDWARE</b>\n"
+        f"  CPU Temp:        {temp_str}\n"
+        f"  Memory:          {mem_str}\n"
+        f"  DB Size:         {db_str}\n"
+        f"  Disk Used:       {disk_str}\n"
+        f"{temp_alert}"
         f"\n"
-        f"<i>Run at {time_str} UTC</i>"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <b>DAILY COSTS</b>\n"
+        f"  El Chef API:     ${api_costs['el_chef']:.3f}\n"
+        f"  El Mecánico:     ${api_costs['el_mecanico']:.3f}\n"
+        f"  La Perra API:    ${api_costs['la_perra']:.3f}\n"
+        f"  ─────────────────────────\n"
+        f"  API Subtotal:    ${total_api:.3f}\n"
+        f"  Electricity:     ${elec['cost']:.4f} ({elec['kwh']}kWh @ ${FPL_RATE})\n"
+        f"  ─────────────────────────\n"
+        f"  💰 TOTAL TODAY:  ${total_daily:.2f}\n"
+        f"  📅 MONTHLY PROJ: ${monthly_proj:.2f}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <b>AI ANALYSIS</b>\n"
+        f"  {claude_analysis}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Status: {status}\n"
+        f"⏰ {time_str} UTC"
     )
 
-    # Telegram message limit is 4096 chars
     if len(msg) > 4000:
         msg = msg[:3990] + "\n<i>[truncated]</i>"
     return msg
 
+
+def format_weekly_summary(summary: dict) -> str:
+    """Format weekly cost summary for Telegram."""
+    success_rate = 0.0
+    if summary["candidates_generated"] > 0:
+        success_rate = summary["candidates_passed"] / summary["candidates_generated"] * 100
+
+    cost_per_pass = 0.0
+    if summary["candidates_passed"] > 0:
+        cost_per_pass = summary["total_cost"] / summary["candidates_passed"]
+
+    # DB growth (approximate from weekly data)
+    alerts = "None"
+
+    msg = (
+        f"📊 <b>oneQuant Weekly</b> — {summary['start_date']} to {summary['end_date']}\n"
+        f"\n"
+        f"💰 <b>WEEKLY COSTS</b>\n"
+        f"  API:             ${summary['total_api_cost']:.2f}\n"
+        f"  Electricity:     ${summary['total_electricity_cost']:.2f} ({summary['total_kwh']:.1f}kWh)\n"
+        f"  ─────────────────────\n"
+        f"  TOTAL:           ${summary['total_cost']:.2f}\n"
+        f"  Daily avg:       ${summary['daily_avg_cost']:.2f}\n"
+        f"\n"
+        f"🧪 <b>STRATEGY PROGRESS</b>\n"
+        f"  Generated:       {summary['candidates_generated']}\n"
+        f"  Passed:          {summary['candidates_passed']}\n"
+        f"  Success rate:    {success_rate:.1f}%\n"
+        f"  Cost per pass:   ${cost_per_pass:.2f}\n"
+        f"\n"
+        f"🌡️ <b>HARDWARE TRENDS</b>\n"
+        f"  Avg CPU Temp:    {summary['avg_cpu_temp']:.1f}°C\n"
+        f"  Peak CPU Temp:   {summary['peak_cpu_temp']:.1f}°C\n"
+        f"\n"
+        f"⚠️ ALERTS: {alerts}"
+    )
+    return msg
+
+
+def format_monthly_summary(summary: dict) -> str:
+    """Format monthly cost summary for Telegram."""
+    success_rate = 0.0
+    if summary["candidates_generated"] > 0:
+        success_rate = summary["candidates_passed"] / summary["candidates_generated"] * 100
+
+    # Auto-generate recommendations
+    recs = []
+    if summary["peak_cpu_temp"] > 70:
+        recs.append("• Consider improving cooling — peak temp exceeded 70°C")
+    if summary["projected_annual"] > 300:
+        recs.append("• Annual projection exceeds $300 — review API usage")
+    if summary["cost_per_candidate"] > 5:
+        recs.append("• High cost per passing strategy — tune generation parameters")
+    if summary["projected_db_annual_mb"] > 2000:
+        recs.append("• DB growth trending high — consider archiving old data")
+    if not recs:
+        recs.append("• All metrics within normal range ✓")
+
+    msg = (
+        f"📊 <b>oneQuant Monthly</b> — {summary['month_name']} {summary['year']}\n"
+        f"\n"
+        f"💰 <b>MONTHLY COSTS</b>\n"
+        f"  API Total:       ${summary['total_api_cost']:.2f}\n"
+        f"  ├ El Chef:       ${summary['el_chef_total']:.2f}\n"
+        f"  ├ El Mecánico:   ${summary['el_mecanico_total']:.2f}\n"
+        f"  └ La Perra:      ${summary['la_perra_total']:.2f}\n"
+        f"  Electricity:     ${summary['total_electricity_cost']:.2f} ({summary['total_kwh']:.1f}kWh)\n"
+        f"  ─────────────────────────\n"
+        f"  TOTAL:           ${summary['total_cost']:.2f}\n"
+        f"  Daily average:   ${summary['daily_avg_cost']:.2f}\n"
+        f"  Annual proj:     ${summary['projected_annual']:.2f}\n"
+        f"\n"
+        f"🧪 <b>STRATEGY PIPELINE</b>\n"
+        f"  Generated:       {summary['candidates_generated']}\n"
+        f"  Passed backtest: {summary['candidates_passed']} ({success_rate:.1f}%)\n"
+        f"  Cost per pass:   ${summary['cost_per_candidate']:.2f}\n"
+        f"\n"
+        f"🌡️ <b>HARDWARE HEALTH</b>\n"
+        f"  Avg CPU Temp:    {summary['avg_cpu_temp']:.1f}°C\n"
+        f"  Peak CPU Temp:   {summary['peak_cpu_temp']:.1f}°C\n"
+        f"  DB Growth:       +{summary['db_growth_mb']:.1f}MB\n"
+        f"  Projected/year:  {summary['projected_db_annual_mb']:.0f}MB\n"
+        f"\n"
+        f"💡 <b>RECOMMENDATIONS</b>\n"
+        + "\n".join(recs)
+    )
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
 
 def send_telegram(message: str) -> bool:
     """Send a Telegram message. Returns True on success."""
@@ -348,8 +812,48 @@ def main() -> None:
     claude_analysis = call_claude(findings)
     print(f"[la_perra] Claude: {claude_analysis[:120]}...")
 
-    # Format and send
-    message = format_telegram_message(findings, claude_analysis, run_time)
+    # Collect hardware stats
+    print("[la_perra] Collecting hardware stats...")
+    hw_stats = get_hardware_stats()
+    print(f"[la_perra] Hardware: temp={hw_stats['cpu_temp_c']}°C "
+          f"mem={hw_stats['memory_pct']}% db={hw_stats['db_size_mb']}MB "
+          f"disk={hw_stats['disk_usage_pct']}%")
+
+    # Calculate costs
+    api_costs = calculate_api_costs()
+    elec = calculate_electricity_cost()
+    print(f"[la_perra] Costs: API=${api_costs['total']:.3f} "
+          f"Electricity=${elec['cost']:.4f} ({elec['kwh']}kWh)")
+
+    # Market maker stats
+    mm_stats = query_mm_today()
+
+    # Save to database
+    print("[la_perra] Saving daily costs to database...")
+    save_daily_costs(hw_stats, api_costs, elec)
+    print("[la_perra] Daily costs saved.")
+
+    # Build daily message
+    message = format_telegram_message(findings, claude_analysis, run_time,
+                                      hw_stats, api_costs, elec, mm_stats)
+
+    # Check if weekly summary needed (Saturday)
+    if run_time.weekday() == 5:  # Saturday
+        print("[la_perra] Saturday — appending weekly summary...")
+        weekly = get_weekly_summary()
+        message += "\n\n" + format_weekly_summary(weekly)
+
+    # Check if monthly summary needed (last day of month)
+    days_in_month = calendar.monthrange(run_time.year, run_time.month)[1]
+    if run_time.day == days_in_month:
+        print("[la_perra] Last day of month — appending monthly summary...")
+        monthly = get_monthly_summary()
+        message += "\n\n" + format_monthly_summary(monthly)
+
+    # Truncate if needed (Telegram limit 4096)
+    if len(message) > 4090:
+        message = message[:4080] + "\n<i>[truncated]</i>"
+
     print(f"\n[la_perra] Summary:\n{message}\n")
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:

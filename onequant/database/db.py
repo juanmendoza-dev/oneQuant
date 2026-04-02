@@ -111,6 +111,26 @@ CREATE TABLE IF NOT EXISTS market_maker_stats (
     created_at TEXT DEFAULT (datetime('now'))
 )"""
 
+CREATE_DAILY_COSTS: str = """
+CREATE TABLE IF NOT EXISTS daily_costs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL UNIQUE,
+    el_chef_cost REAL DEFAULT 0.0,
+    el_mecanico_cost REAL DEFAULT 0.0,
+    la_perra_cost REAL DEFAULT 0.0,
+    total_api_cost REAL DEFAULT 0.0,
+    electricity_kwh REAL DEFAULT 0.0,
+    electricity_cost REAL DEFAULT 0.0,
+    total_cost REAL DEFAULT 0.0,
+    avg_cpu_temp_c REAL DEFAULT 0.0,
+    peak_cpu_temp_c REAL DEFAULT 0.0,
+    avg_memory_pct REAL DEFAULT 0.0,
+    db_size_mb REAL DEFAULT 0.0,
+    candidates_generated INTEGER DEFAULT 0,
+    candidates_passed INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+)"""
+
 CREATE_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_candles_symbol ON btc_candles(symbol)",
     "CREATE INDEX IF NOT EXISTS idx_candles_ts ON btc_candles(timestamp)",
@@ -147,6 +167,7 @@ async def init_db() -> None:
     await _conn.execute(CREATE_PAPER_TRADES)
     await _conn.execute(CREATE_MM_TRADES)
     await _conn.execute(CREATE_MM_STATS)
+    await _conn.execute(CREATE_DAILY_COSTS)
     for idx_sql in CREATE_INDEXES:
         await _conn.execute(idx_sql)
     await _conn.commit()
