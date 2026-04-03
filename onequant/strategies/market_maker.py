@@ -1,5 +1,5 @@
-"""
-Market Maker Strategy for BTC/USD on Binance.US.
+"""Market Maker Strategy for BTC/USD on Binance.US.
+
 Places buy and sell limit orders around current price.
 Collects the spread when both sides fill.
 Uses 0% maker fees for pure profit.
@@ -11,48 +11,50 @@ Live trading mode: places real orders on Binance.US.
 import asyncio
 import logging
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from dataclasses import dataclass
 from typing import Optional
 
-from database.db import insert_mm_trade
+from config import config
+from database.db import insert_mm_trade, insert_system_log
+from feeds.binance_rest import get_ticker
+from safety.circuit_breaker import CircuitBreaker
+from safety.fee_monitor import FeeMonitor
+from safety.kill_switch import is_kill_switch_active
+from safety.order_validator import OrderValidator
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("market_maker")
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class MMOrder:
-    side: str           # BUY or SELL
+    """Represents a single market maker order."""
+    side: str
     price: float
     quantity_btc: float
     value_usd: float
     order_id: Optional[str] = None
     filled: bool = False
     fill_price: float = 0.0
-    fill_time: str = ""
+    fill_time: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Strategy
+# ---------------------------------------------------------------------------
 
 
 class MarketMakerStrategy:
-    """
-    Market making strategy.
-
-    Logic:
-    1. Get current BTC/USD mid price
-    2. Calculate bid = mid * (1 - spread/2)
-    3. Calculate ask = mid * (1 + spread/2)
-    4. Place LIMIT buy at bid
-    5. Place LIMIT sell at ask
-    6. Monitor for fills every 30 seconds
-    7. When buy fills: wait for sell to fill
-    8. When both fill: record round trip profit
-    9. Replace orders immediately
-    10. Check safety system before every cycle
+    """Market making strategy — places bid/ask around mid price.
 
     Inventory management:
     - Track BTC inventory (net position)
-    - If inventory > 80% of capital: skip buy orders
-    - If inventory < 20% of capital: skip sell orders
-    - This prevents one-sided inventory buildup
+    - If BTC value > max_inventory_pct of capital: skip buy orders
+    - If BTC value < (1 - max_inventory_pct) of capital: skip sell orders
     """
 
     STRATEGY_NAME = "market_maker"
@@ -62,295 +64,226 @@ class MarketMakerStrategy:
         capital_usd: float,
         spread_pct: float,
         paper_trading: bool,
-        circuit_breaker,
-        order_validator,
-        db_conn=None,
-        binance_rest=None,
+        circuit_breaker: CircuitBreaker,
+        fee_monitor: FeeMonitor,
+        order_validator: OrderValidator,
+        max_inventory_pct: float = 0.8,
     ):
         self.capital_usd = capital_usd
         self.spread_pct = spread_pct
         self.paper_trading = paper_trading
         self.circuit_breaker = circuit_breaker
+        self.fee_monitor = fee_monitor
         self.order_validator = order_validator
-        self.db = db_conn
-        self.binance = binance_rest
+        self.max_inventory_pct = max_inventory_pct
 
-        self.btc_inventory = 0.0
-        self.usd_inventory = capital_usd
-        self.active_buy_order: Optional[MMOrder] = None
-        self.active_sell_order: Optional[MMOrder] = None
-        self.total_round_trips = 0
-        self.total_spread_collected = 0.0
-        self.last_price = 0.0
+        self.btc_inventory: float = 0.0
+        self.usd_inventory: float = capital_usd
+        self.active_buy: Optional[MMOrder] = None
+        self.active_sell: Optional[MMOrder] = None
+        self.total_round_trips: int = 0
+        self.total_spread_collected: float = 0.0
+        self.best_spread: float = 0.0
+        self.last_price: float = 0.0
+        self._cycle_count: int = 0
 
+        mode = "PAPER" if paper_trading else "LIVE"
         logger.info(
-            "Market Maker initialized: "
-            "$%.2f capital, %.3f%% spread, %s mode",
-            capital_usd, spread_pct * 100,
-            "PAPER" if paper_trading else "LIVE",
+            "Market Maker initialized: $%.2f capital, %.3f%% spread, %s mode",
+            capital_usd, spread_pct * 100, mode,
         )
 
-    def _get_order_quantity(self, price: float) -> float:
-        """Calculate order size in BTC."""
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _order_quantity(self, price: float) -> float:
+        """Order size = 40% of capital in BTC."""
         order_value = self.capital_usd * 0.4
         return round(order_value / price, 6)
 
-    def _calculate_spread(self, mid_price: float) -> tuple[float, float]:
-        """Returns (bid_price, ask_price)."""
-        half_spread = self.spread_pct / 2
-        bid = mid_price * (1 - half_spread)
-        ask = mid_price * (1 + half_spread)
-        return round(bid, 2), round(ask, 2)
+    def _bid_ask(self, mid: float) -> tuple[float, float]:
+        """Return (bid, ask) around mid price."""
+        half = self.spread_pct / 2
+        return round(mid * (1 - half), 2), round(mid * (1 + half), 2)
 
-    def _inventory_allows_buy(self) -> bool:
-        """Check if BTC inventory is below max threshold."""
-        if self.last_price <= 0:
-            return True
-        btc_value = self.btc_inventory * self.last_price
-        total_value = btc_value + self.usd_inventory
-        if total_value <= 0:
-            return False
-        return (btc_value / total_value) < 0.8
+    def _inventory_value(self, price: float) -> float:
+        """BTC inventory value in USD."""
+        return self.btc_inventory * price
 
-    def _inventory_allows_sell(self) -> bool:
-        """Check if we have BTC to sell."""
-        return self.btc_inventory > 0
+    def _should_skip_buy(self, price: float) -> bool:
+        """Skip buys if BTC inventory is too high."""
+        inv_pct = self._inventory_value(price) / self.capital_usd if self.capital_usd > 0 else 0
+        return inv_pct > self.max_inventory_pct
 
-    async def _paper_check_fills(self, current_price: float):
-        """
-        Simulate fills in paper trading mode.
-        Buy order fills if current price <= bid price.
-        Sell order fills if current price >= ask price.
-        """
-        now = datetime.now(timezone.utc).isoformat()
+    def _should_skip_sell(self, price: float) -> bool:
+        """Skip sells if BTC inventory is too low (nothing to sell)."""
+        return self.btc_inventory <= 0 and self.active_buy is None
 
-        if (self.active_buy_order and
-                not self.active_buy_order.filled):
-            if current_price <= self.active_buy_order.price:
-                self.active_buy_order.filled = True
-                self.active_buy_order.fill_price = self.active_buy_order.price
-                self.active_buy_order.fill_time = now
-                self.btc_inventory += self.active_buy_order.quantity_btc
-                self.usd_inventory -= self.active_buy_order.value_usd
+    # ------------------------------------------------------------------
+    # Paper fill simulation
+    # ------------------------------------------------------------------
+
+    async def _paper_check_fills(self, price: float) -> None:
+        """Simulate fills: buy fills if price <= bid, sell fills if price >= ask."""
+        now = int(time.time())
+
+        if self.active_buy and not self.active_buy.filled:
+            if price <= self.active_buy.price:
+                self.active_buy.filled = True
+                self.active_buy.fill_price = self.active_buy.price
+                self.active_buy.fill_time = now
+                self.btc_inventory += self.active_buy.quantity_btc
+                self.usd_inventory -= self.active_buy.value_usd
                 logger.info(
                     "[PAPER] BUY filled: %.6f BTC @ $%.2f",
-                    self.active_buy_order.quantity_btc,
-                    self.active_buy_order.price,
+                    self.active_buy.quantity_btc, self.active_buy.price,
                 )
                 await insert_mm_trade(
-                    timestamp=now,
-                    side="BUY",
-                    price=self.active_buy_order.price,
-                    quantity_btc=self.active_buy_order.quantity_btc,
-                    value_usd=self.active_buy_order.value_usd,
-                    fee_usd=0.0,
-                    order_id="PAPER",
-                    status="FILLED",
-                    paper_trade=True,
+                    timestamp=now, side="BUY",
+                    price=self.active_buy.price,
+                    quantity_btc=self.active_buy.quantity_btc,
+                    value_usd=self.active_buy.value_usd,
+                    fee_usd=0.0, order_id="paper",
+                    status="FILLED", paper_trade=True,
                 )
 
-        if (self.active_sell_order and
-                not self.active_sell_order.filled):
-            if current_price >= self.active_sell_order.price:
-                self.active_sell_order.filled = True
-                self.active_sell_order.fill_price = self.active_sell_order.price
-                self.active_sell_order.fill_time = now
-                self.btc_inventory -= self.active_sell_order.quantity_btc
-                self.usd_inventory += self.active_sell_order.value_usd
+        if self.active_sell and not self.active_sell.filled:
+            if price >= self.active_sell.price:
+                self.active_sell.filled = True
+                self.active_sell.fill_price = self.active_sell.price
+                self.active_sell.fill_time = now
+                self.btc_inventory -= self.active_sell.quantity_btc
+                self.usd_inventory += self.active_sell.value_usd
                 logger.info(
                     "[PAPER] SELL filled: %.6f BTC @ $%.2f",
-                    self.active_sell_order.quantity_btc,
-                    self.active_sell_order.price,
+                    self.active_sell.quantity_btc, self.active_sell.price,
                 )
                 await insert_mm_trade(
-                    timestamp=now,
-                    side="SELL",
-                    price=self.active_sell_order.price,
-                    quantity_btc=self.active_sell_order.quantity_btc,
-                    value_usd=self.active_sell_order.value_usd,
-                    fee_usd=0.0,
-                    order_id="PAPER",
-                    status="FILLED",
-                    paper_trade=True,
+                    timestamp=now, side="SELL",
+                    price=self.active_sell.price,
+                    quantity_btc=self.active_sell.quantity_btc,
+                    value_usd=self.active_sell.value_usd,
+                    fee_usd=0.0, order_id="paper",
+                    status="FILLED", paper_trade=True,
                 )
 
-    async def _record_round_trip(self):
-        """Record completed round trip profit."""
-        if (not self.active_buy_order or
-                not self.active_sell_order):
+    # ------------------------------------------------------------------
+    # Round trip recording
+    # ------------------------------------------------------------------
+
+    async def _check_round_trip(self) -> None:
+        """If both buy and sell filled, record the spread profit."""
+        if not (self.active_buy and self.active_sell):
             return
-        if (not self.active_buy_order.filled or
-                not self.active_sell_order.filled):
+        if not (self.active_buy.filled and self.active_sell.filled):
             return
 
         spread_usd = (
-            self.active_sell_order.fill_price -
-            self.active_buy_order.fill_price
-        ) * self.active_buy_order.quantity_btc
-
+            (self.active_sell.fill_price - self.active_buy.fill_price)
+            * self.active_buy.quantity_btc
+        )
         self.total_round_trips += 1
         self.total_spread_collected += spread_usd
+        if spread_usd > self.best_spread:
+            self.best_spread = spread_usd
 
         logger.info(
-            "Round trip #%d: +$%.4f spread collected (total: $%.4f)",
+            "Round trip #%d: +$%.4f spread (total: $%.4f)",
             self.total_round_trips, spread_usd, self.total_spread_collected,
         )
 
-        # Record in circuit breaker
         self.circuit_breaker.record_trade_pnl(
-            self.STRATEGY_NAME,
-            spread_usd,
-            won=spread_usd > 0,
+            self.STRATEGY_NAME, spread_usd, won=spread_usd > 0,
         )
 
-        # Update the sell trade record with spread collected
-        now = datetime.now(timezone.utc).isoformat()
-        await insert_mm_trade(
-            timestamp=now,
-            side="ROUND_TRIP",
-            price=self.active_sell_order.fill_price,
-            quantity_btc=self.active_buy_order.quantity_btc,
-            value_usd=spread_usd,
-            fee_usd=0.0,
-            order_id="PAPER",
-            status="FILLED",
-            paper_trade=self.paper_trading,
-            spread_collected_usd=spread_usd,
-        )
+        # Clear for next pair
+        self.active_buy = None
+        self.active_sell = None
 
-    async def run_cycle(self, current_price: float):
-        """
-        Main market making cycle.
-        Called every 30 seconds.
-        """
-        # Safety check first
-        allowed, reason = self.circuit_breaker.is_trading_allowed(
-            self.STRATEGY_NAME
-        )
+    # ------------------------------------------------------------------
+    # Main cycle
+    # ------------------------------------------------------------------
+
+    async def run_cycle(self, current_price: float) -> None:
+        """One market-making cycle. Called every MM_ORDER_REFRESH_SEC."""
+        self._cycle_count += 1
+
+        # Safety gate
+        allowed, reason = self.circuit_breaker.is_trading_allowed(self.STRATEGY_NAME)
         if not allowed:
             logger.warning("Market maker paused: %s", reason)
             return
 
+        if is_kill_switch_active():
+            logger.warning("Market maker paused: kill switch active")
+            return
+
         self.last_price = current_price
-        bid, ask = self._calculate_spread(current_price)
-        qty = self._get_order_quantity(current_price)
+        bid, ask = self._bid_ask(current_price)
+        qty = self._order_quantity(current_price)
 
+        # --- paper mode ---
         if self.paper_trading:
-            # Check for paper fills
             await self._paper_check_fills(current_price)
+            await self._check_round_trip()
 
-            # Record completed round trips
-            if (self.active_buy_order and
-                    self.active_sell_order and
-                    self.active_buy_order.filled and
-                    self.active_sell_order.filled):
-                await self._record_round_trip()
-                self.active_buy_order = None
-                self.active_sell_order = None
-
-            # Place new orders if needed
-            if not self.active_buy_order and self._inventory_allows_buy():
-                self.active_buy_order = MMOrder(
-                    side="BUY",
-                    price=bid,
-                    quantity_btc=qty,
-                    value_usd=qty * bid,
+            # Place new buy if needed
+            if not self.active_buy and not self._should_skip_buy(current_price):
+                self.active_buy = MMOrder(
+                    side="BUY", price=bid,
+                    quantity_btc=qty, value_usd=qty * bid,
                 )
                 logger.info("[PAPER] BUY order: %.6f BTC @ $%.2f", qty, bid)
 
-            if not self.active_sell_order and self._inventory_allows_sell():
-                self.active_sell_order = MMOrder(
-                    side="SELL",
-                    price=ask,
-                    quantity_btc=qty,
-                    value_usd=qty * ask,
+            # Place new sell if needed
+            if not self.active_sell and not self._should_skip_sell(current_price):
+                self.active_sell = MMOrder(
+                    side="SELL", price=ask,
+                    quantity_btc=qty, value_usd=qty * ask,
                 )
                 logger.info("[PAPER] SELL order: %.6f BTC @ $%.2f", qty, ask)
-            elif not self.active_sell_order and not self._inventory_allows_sell():
-                # First cycle: place sell anyway to allow round trips
-                if self.total_round_trips == 0 and self.active_buy_order:
-                    self.active_sell_order = MMOrder(
-                        side="SELL",
-                        price=ask,
-                        quantity_btc=qty,
-                        value_usd=qty * ask,
-                    )
-                    logger.info("[PAPER] SELL order (initial): %.6f BTC @ $%.2f", qty, ask)
 
+            # Re-quote if price moved >0.5% from existing orders
+            if self.active_buy and not self.active_buy.filled:
+                drift = abs(current_price - self.active_buy.price) / current_price
+                if drift > 0.005:
+                    self.active_buy = MMOrder(
+                        side="BUY", price=bid,
+                        quantity_btc=qty, value_usd=qty * bid,
+                    )
+                    logger.info("[PAPER] BUY re-quoted: %.6f BTC @ $%.2f", qty, bid)
+
+            if self.active_sell and not self.active_sell.filled:
+                drift = abs(current_price - self.active_sell.price) / current_price
+                if drift > 0.005:
+                    self.active_sell = MMOrder(
+                        side="SELL", price=ask,
+                        quantity_btc=qty, value_usd=qty * ask,
+                    )
+                    logger.info("[PAPER] SELL re-quoted: %.6f BTC @ $%.2f", qty, ask)
+
+        # --- live mode (future) ---
         else:
-            # LIVE TRADING
-            # Cancel stale orders if price moved too much
-            if self.active_buy_order:
-                price_move = abs(
-                    current_price - self.active_buy_order.price
-                ) / current_price
-                if price_move > 0.005:  # 0.5% move
-                    await self.binance.cancel_order(
-                        self.active_buy_order.order_id
-                    )
-                    self.active_buy_order = None
+            # TODO: implement live order placement via binance_rest
+            logger.warning("Live trading not yet implemented")
 
-            if self.active_sell_order:
-                price_move = abs(
-                    current_price - self.active_sell_order.price
-                ) / current_price
-                if price_move > 0.005:
-                    await self.binance.cancel_order(
-                        self.active_sell_order.order_id
-                    )
-                    self.active_sell_order = None
+        # Status log every 10 minutes (20 cycles at 30s)
+        if self._cycle_count % 20 == 0:
+            mode = "PAPER" if self.paper_trading else "LIVE"
+            logger.info(
+                "MM Status [%s]: %d round trips, $%.4f spread, "
+                "BTC inv=%.6f, USD inv=$%.2f, price=$%.2f",
+                mode, self.total_round_trips, self.total_spread_collected,
+                self.btc_inventory, self.usd_inventory, current_price,
+            )
 
-            # Place fresh orders
-            if not self.active_buy_order and self._inventory_allows_buy():
-                valid, reason = self.order_validator.validate(
-                    order_type="LIMIT",
-                    side="BUY",
-                    quantity_btc=qty,
-                    price=bid,
-                    stop_loss_price=bid * 0.97,
-                    account_balance=self.capital_usd,
-                )
-                if valid:
-                    order = await self.binance.place_limit_order(
-                        side="BUY",
-                        quantity=qty,
-                        price=bid,
-                    )
-                    if order:
-                        self.active_buy_order = MMOrder(
-                            side="BUY",
-                            price=bid,
-                            quantity_btc=qty,
-                            value_usd=qty * bid,
-                            order_id=order.get("orderId"),
-                        )
-
-            if not self.active_sell_order and self._inventory_allows_sell():
-                valid, reason = self.order_validator.validate(
-                    order_type="LIMIT",
-                    side="SELL",
-                    quantity_btc=qty,
-                    price=ask,
-                    stop_loss_price=ask * 1.03,
-                    account_balance=self.capital_usd,
-                )
-                if valid:
-                    order = await self.binance.place_limit_order(
-                        side="SELL",
-                        quantity=qty,
-                        price=ask,
-                    )
-                    if order:
-                        self.active_sell_order = MMOrder(
-                            side="SELL",
-                            price=ask,
-                            quantity_btc=qty,
-                            value_usd=qty * ask,
-                            order_id=order.get("orderId"),
-                        )
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
 
     def get_status(self) -> dict:
-        """Returns current market maker status."""
+        """Current market maker state for API/dashboard."""
         return {
             "strategy": self.STRATEGY_NAME,
             "mode": "PAPER" if self.paper_trading else "LIVE",
@@ -359,7 +292,73 @@ class MarketMakerStrategy:
             "usd_inventory": round(self.usd_inventory, 2),
             "total_round_trips": self.total_round_trips,
             "total_spread_collected": round(self.total_spread_collected, 4),
-            "active_buy_order": self.active_buy_order.price if self.active_buy_order else None,
-            "active_sell_order": self.active_sell_order.price if self.active_sell_order else None,
+            "best_spread_usd": round(self.best_spread, 4),
+            "active_buy_price": self.active_buy.price if self.active_buy else None,
+            "active_sell_price": self.active_sell.price if self.active_sell else None,
             "last_price": self.last_price,
+            "spread_pct": self.spread_pct * 100,
         }
+
+
+# ---------------------------------------------------------------------------
+# Async runner (called from main.py)
+# ---------------------------------------------------------------------------
+
+
+async def run_market_maker(
+    circuit_breaker: CircuitBreaker,
+    fee_monitor: FeeMonitor,
+    order_validator: OrderValidator,
+) -> None:
+    """Asyncio task: run market maker cycles forever."""
+    from pathlib import Path
+    Path("logs").mkdir(exist_ok=True)
+    if not logger.handlers:
+        fh = logging.FileHandler("logs/market_maker.log")
+        fh.setLevel(logging.DEBUG)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s")
+        fh.setFormatter(fmt)
+        ch.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.addHandler(ch)
+        logger.setLevel(logging.DEBUG)
+
+    mm = MarketMakerStrategy(
+        capital_usd=config.MM_CAPITAL_USD,
+        spread_pct=config.MM_SPREAD_PCT,
+        paper_trading=config.MM_PAPER_TRADING,
+        circuit_breaker=circuit_breaker,
+        fee_monitor=fee_monitor,
+        order_validator=order_validator,
+        max_inventory_pct=config.MM_MAX_INVENTORY_PCT,
+    )
+
+    # Store reference for API access
+    run_market_maker._instance = mm
+
+    refresh = config.MM_ORDER_REFRESH_SEC
+
+    while True:
+        try:
+            price = await get_ticker()
+            if price is not None and price > 0:
+                await mm.run_cycle(price)
+            else:
+                logger.warning("Could not fetch price — skipping cycle")
+        except asyncio.CancelledError:
+            logger.info("Market maker task cancelled — shutting down")
+            return
+        except Exception as exc:
+            logger.error("Market maker error: %s", exc)
+            try:
+                await insert_system_log("market_maker", "ERROR", str(exc))
+            except Exception:
+                pass
+
+        await asyncio.sleep(refresh)
+
+
+# Accessor for API
+run_market_maker._instance = None

@@ -119,68 +119,69 @@ def read_results_context() -> str:
 # Anthropic API calls
 # ---------------------------------------------------------------------------
 
-def read_mean_reversion_context() -> str:
-    """Read mean_reversion.py to understand what a passing strategy looks like."""
-    mr_path = STRATEGIES_DIR / "mean_reversion.py"
-    if mr_path.exists():
-        return mr_path.read_text(encoding="utf-8")
-    return "Mean reversion strategy file not found."
-
-
 def call_sonnet_for_concept(rejected_md: str, results_context: str) -> str:
     """Call claude-sonnet-4-6 to propose ONE new strategy concept (text only)."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    mean_reversion_code = read_mean_reversion_context()
 
     prompt = f"""You are a quant strategy researcher for a Bitcoin trading bot.
 
-REJECTED STRATEGIES — study the failure patterns carefully:
+REJECTED STRATEGIES (do not repeat or closely resemble these):
 ---
 {rejected_md}
 ---
 
-KEY PATTERNS FROM REJECTIONS:
-- RANGING regime dominates 98%+ of trades and destroys all strategies that don't filter it
-- High-frequency signals (>5/week) on 15m candles are almost always noise
-- Volume-based filters (2x avg) select exhaustion candles, not continuation
-- EMA crossovers, RSI extremes alone, and VWAP deviation are insufficient edges
-- Strategies with WR < 55% need TP:SL > 2:1 but then fire too rarely
-
-WORKING STRATEGY (Mean Reversion Config A — study what it does RIGHT):
----
-{mean_reversion_code}
----
-Why it works: SELL-only in BULL_TREND regime, fires 2-5x/week, RSI > 75 + EMA
-deviation > 1.5% catches genuine overbought extensions, volume confirmation. WR 76.8%,
-PF 1.47, MaxDD -2.5%. The regime filter is the critical ingredient.
-
-PREVIOUS CANDIDATE RESULTS:
+PREVIOUS CANDIDATE RESULTS (also do not repeat strategies that already failed):
 ---
 {results_context}
 ---
 
-Suggest ONE new trading strategy concept for 15-minute BTC-USD candles.
+Suggest ONE new trading strategy concept for 1-HOUR BTC-USD candles.
 
-CRITICAL REQUIREMENTS:
-- MUST include a regime filter (BULL_TREND, BEAR_TREND, or both) — NEVER trade RANGING
-- Target 2-5 signals per week (not 20+, not 0.5)
-- Must use LIMIT orders only (0% maker fee on Binance.US)
-- EV math: (WR × TP%) − ((1−WR) × SL%) > 0.1% (slippage + spread)
-- Only OHLCV data: timestamp, open, high, low, close, volume
-- Must be distinct from all rejected strategies AND mean reversion
+IMPORTANT — EMPIRICAL DATA FROM 40,721 1h CANDLES (2020–2026):
 
-Describe:
-1. Core signal logic (entry conditions — be specific)
-2. Regime filter (which regime and how detected)
-3. Expected WR with mathematical justification
-4. SL% and TP% with EV calculation
-5. Why this edge exists in 15m BTC specifically
+A proven profitable edge has been found. Use it as your foundation and IMPROVE on it:
 
-Text only — no Python code, no markdown code blocks."""
+PROVEN EDGE — 1H Liquidity Sweep Reversal:
+  A wick below the 12-candle (12h) rolling low that closes back above it.
+  Overall: 79.4% 6h-win rate, 2464 sweeps, avg bounce 1.28%, median 0.80%
+  With SL=10% / TP=8%: 204 trades, WR=58.8%, PF=1.137, P&L=+$9.10 on $75
+
+  Best hours by 6h win rate:
+    21:00 UTC (17:00 ET) — 88.5% win (n=78)
+    19:00 UTC (15:00 ET) — 87.0% win (n=100)
+    20:00 UTC (16:00 ET) — 86.6% win (n=112)
+
+  Mean reversion data (after 3 consecutive same-direction 1h candles):
+    21:00 UTC — 59.9% reversal rate, avg magnitude 1.74%
+    14:00 UTC — 58.8% reversal rate, avg magnitude 2.14%
+
+Bankroll: $75 account. The backtest engine uses SL=10% / TP=8% (cannot be overridden).
+Strategies MUST achieve PF > 1.0 and WR > 55% to pass.
+
+BUILD ON THE PROVEN EDGE by combining or enhancing:
+- Sweep + mean reversion confluence (sweep occurs after 3 same-direction candles)
+- Sweep + trend filter (EMA alignment, regime detection)
+- Sweep + volume spike confirmation
+- Multi-signal confirmation (sweep + RSI extreme + support reclaim)
+- Bidirectional: add SELL signals for sweeps above 12-candle rolling HIGH
+
+Requirements:
+- Must use 1h timeframe candles
+- Must be implementable using only: timestamp, open, high, low, close, volume
+- No external data sources
+- Must be distinct from the base "1H Sweep Reversal" and all rejected strategies
+
+In your response describe:
+1. The core signal logic — what specifically improves on the base sweep strategy
+2. Why this enhancement should improve PF above 1.137 (the current baseline)
+3. Expected win rate and reasoning
+4. How the strategy avoids overfitting (out-of-sample reasoning, not curve fitting)
+
+Respond with text only — no Python code, no markdown code blocks."""
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=500,
+        max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
@@ -209,7 +210,7 @@ STRICT REQUIREMENTS:
 2. Define exactly ONE class that inherits BaseStrategy
 3. The class MUST have these class-level annotations:
    name: str = "Your Strategy Name Here"   # unique, descriptive, max 50 chars
-   timeframe: str = "15m"
+   timeframe: str = "1h"
    required_candles: int = <N>             # minimum candles needed, at least 22
 4. Implement generate_signal(self, candles: list[dict]) -> Signal
    - candles: list of dicts with keys timestamp, open, high, low, close, volume
@@ -301,15 +302,17 @@ def dynamic_import_strategy(file_path: Path, class_name: str) -> type:
 def run_candidate_backtest(StrategyClass: type):
     """Run backtest on the candidate strategy and return (Metrics, BacktestResult)."""
     instance = StrategyClass()
+    # Use strategy-declared timeframe if present, default to 1h
+    timeframe = getattr(instance, "timeframe", "1h")
     cfg = BacktestConfig(
         strategy=instance,
-        timeframe="15m",
-        initial_capital=250.0,
-        stop_loss_pct=0.06,
-        take_profit_pct=0.04,
+        timeframe=timeframe,
+        symbol="BTCUSD",
+        initial_capital=75.0,
+        stop_loss_pct=0.10,
+        take_profit_pct=0.08,
         min_confidence=0.55,
         order_type="limit",
-        symbol="BTCUSD",
     )
     result = run_backtest(cfg)
     metrics = calculate_metrics(result)
@@ -425,11 +428,7 @@ def main() -> None:
     write_rate_limit()
     print("[el_chef] Rate limit updated.")
 
-    # 7. Strip markdown fences if present
-    code = re.sub(r'^```(?:python)?\s*\n', '', code)
-    code = re.sub(r'\n```\s*$', '', code)
-
-    # Parse class and strategy name
+    # 7. Parse class and strategy name
     try:
         class_name = extract_class_name(code)
     except ValueError as e:
