@@ -14,6 +14,7 @@ import calendar
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -59,6 +60,12 @@ BACKTEST_PREDICTED_WR = 76.8
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+LOGS_DIR = REPO_ROOT / "logs"
+STRATEGIES_DIR = ONEQUANT_DIR / "strategies"
+
+# Low-frequency strategies where 0 trades over weeks is normal
+LOW_FREQ_STRATEGIES = {"mean_reversion", "bb_reversion"}
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -219,6 +226,11 @@ Check for these suspicious patterns:
 3. Max drawdown below 0.5%
 4. Zero losing trades
 5. Paper vs backtest divergence above 10 percentage points
+
+IMPORTANT: Zero completed trades is NORMAL and NOT suspicious if:
+- The system has been running less than 30 days, OR
+- The strategies are low-frequency (e.g. mean_reversion, bb_reversion) which may only fire ~5 times per year.
+Only flag zero trades as suspicious if the system has been running > 30 days AND all strategies are high-frequency.
 
 Respond with exactly one line:
 - "CLEAN" if no suspicious patterns are found
@@ -534,6 +546,160 @@ def query_mm_today() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Strategy activity: El Chef / El Mecánico / Validated strategies
+# ---------------------------------------------------------------------------
+
+def _parse_log_tail(log_path: Path, lines: int = 50) -> list[str]:
+    """Return the last *lines* lines of a log file, or empty list if missing."""
+    if not log_path.exists():
+        return []
+    try:
+        text = log_path.read_text(errors="replace")
+        return text.splitlines()[-lines:]
+    except OSError:
+        return []
+
+
+def get_el_chef_activity() -> dict:
+    """Parse el_chef.log for last run info."""
+    log_path = LOGS_DIR / "el_chef.log"
+    if not log_path.exists():
+        return {"last_run": None, "strategy": None, "backtest": None,
+                "wr": None, "pf": None, "dd": None}
+
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return {"last_run": None, "strategy": None, "backtest": None,
+                "wr": None, "pf": None, "dd": None}
+
+    lines = text.splitlines()
+
+    # Use file mtime as fallback timestamp
+    try:
+        mtime = datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc)
+        file_ts = mtime.strftime("%Y-%m-%d %H:%M UTC")
+    except OSError:
+        file_ts = "unknown"
+
+    last_run = None
+    strategy = None
+    backtest = None
+    wr = pf = dd = None
+
+    for line in reversed(lines):
+        if "Starting strategy generation" in line:
+            m = re.match(r"\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})", line)
+            if m:
+                last_run = m.group(1)
+            elif not last_run:
+                last_run = file_ts
+            break
+        if "Generated:" in line and not strategy:
+            m = re.search(r"Generated:\s*(\S+)", line)
+            if m:
+                strategy = m.group(1)
+        if "Backtest failed" in line and backtest is None:
+            backtest = "FAILED"
+        if ("Backtest passed" in line or
+                ("PASSED" in line.upper() and "backtest" in line.lower())) and backtest is None:
+            backtest = "PASSED"
+        if "WR" in line or "win_rate" in line.lower():
+            m = re.search(r"(?:WR|win_rate)[=:\s]+(\d+\.?\d*)%?", line, re.IGNORECASE)
+            if m and not wr:
+                wr = m.group(1)
+        if "PF" in line or "profit_factor" in line.lower():
+            m = re.search(r"(?:PF|profit_factor)[=:\s]+(\d+\.?\d*)", line, re.IGNORECASE)
+            if m and not pf:
+                pf = m.group(1)
+        if "DD" in line or "drawdown" in line.lower():
+            m = re.search(r"(?:DD|drawdown|max_dd)[=:\s]+(\d+\.?\d*)%?", line, re.IGNORECASE)
+            if m and not dd:
+                dd = m.group(1)
+
+    return {"last_run": last_run, "strategy": strategy, "backtest": backtest,
+            "wr": wr, "pf": pf, "dd": dd}
+
+
+def get_el_mecanico_activity() -> dict:
+    """Parse el_mecanico.log for last run info."""
+    log_path = LOGS_DIR / "el_mecanico.log"
+    if not log_path.exists():
+        return {"last_run": None, "strategy": None, "attempt": None,
+                "max_attempts": 5, "result": None}
+    try:
+        tail = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        tail = []
+    if not tail:
+        return {"last_run": None, "strategy": None, "attempt": None,
+                "max_attempts": 5, "result": None}
+
+    last_run = None
+    strategy = None
+    attempt = None
+    result = None
+
+    for line in reversed(tail):
+        if "Starting" in line or "starting" in line:
+            m = re.match(r"\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})", line)
+            if m:
+                last_run = m.group(1)
+            elif not last_run:
+                last_run = "see log"
+            break
+        if ("strategy" in line.lower() or "attempting" in line.lower()) and not strategy:
+            m = re.search(r"(?:strategy|attempting)[=:\s]+(\S+)", line, re.IGNORECASE)
+            if m:
+                strategy = m.group(1)
+        if "attempt" in line.lower() and attempt is None:
+            m = re.search(r"attempt[=:\s]+(\d+)", line, re.IGNORECASE)
+            if m:
+                attempt = m.group(1)
+        if "PASSED" in line.upper() and result is None:
+            result = "PASSED"
+        if "FAILED" in line.upper() and result is None:
+            result = "FAILED"
+
+    return {"last_run": last_run, "strategy": strategy, "attempt": attempt,
+            "max_attempts": 5, "result": result}
+
+
+def get_validated_strategies() -> dict:
+    """List validated (non-candidate) strategy files and paper trade info."""
+    validated = []
+    if STRATEGIES_DIR.exists():
+        for f in sorted(STRATEGIES_DIR.glob("*.py")):
+            name = f.stem
+            if name.startswith("candidate_") or name in ("__init__", "base"):
+                continue
+            validated.append(name)
+
+    # Query paper trades grouped by strategy
+    strategy_trades = {}
+    if DB_PATH.exists():
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            rows = conn.execute("""
+                SELECT strategy,
+                       COUNT(*) as trade_count,
+                       MIN(created_at) as first_trade
+                FROM paper_trades
+                GROUP BY strategy
+            """).fetchall()
+            conn.close()
+            for row in rows:
+                strategy_trades[row[0]] = {
+                    "trade_count": row[1],
+                    "first_trade": row[2],
+                }
+        except sqlite3.Error:
+            pass
+
+    return {"validated": validated, "strategy_trades": strategy_trades}
+
+
+# ---------------------------------------------------------------------------
 # Telegram message formats
 # ---------------------------------------------------------------------------
 
@@ -558,7 +724,10 @@ def _fmt(val, fmt_str=".2f", suffix="", prefix="$", na="N/A"):
 
 def format_telegram_message(findings: dict, claude_analysis: str, run_time: datetime,
                             hw_stats: dict, api_costs: dict, elec: dict,
-                            mm_stats: dict) -> str:
+                            mm_stats: dict,
+                            chef: dict | None = None,
+                            mecanico: dict | None = None,
+                            strats: dict | None = None) -> str:
     """Format the daily summary as an HTML Telegram message."""
     date_str = run_time.strftime("%Y-%m-%d")
     time_str = run_time.strftime("%H:%M")
@@ -580,6 +749,65 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
             f"  Actual WR:       {ts['actual_win_rate_pct']:.1f}% (predicted {BACKTEST_PREDICTED_WR}%)\n"
             f"  Market Maker:    {mm_stats['round_trips']} round trips"
         )
+
+    # Strategy activity blocks
+    chef = chef or {}
+    mecanico = mecanico or {}
+    strats = strats or {}
+
+    chef_run = chef.get("last_run") or "not run yet"
+    chef_strat = chef.get("strategy") or "none"
+    chef_bt = chef.get("backtest") or "not run"
+    chef_wr = f'{chef["wr"]}%' if chef.get("wr") else "N/A"
+    chef_pf = chef.get("pf") or "N/A"
+    chef_dd = f'{chef["dd"]}%' if chef.get("dd") else "N/A"
+
+    mec_run = mecanico.get("last_run") or "not run yet"
+    mec_strat = mecanico.get("strategy") or "none"
+    mec_attempt = mecanico.get("attempt") or "N/A"
+    mec_max = mecanico.get("max_attempts", 5)
+    mec_result = mecanico.get("result") or "not run"
+
+    validated = strats.get("validated", [])
+    strategy_trades = strats.get("strategy_trades", {})
+    in_paper = [v for v in validated if v in strategy_trades or v not in ("market_maker",)]
+    strat_lines = ""
+    for name in validated:
+        info = strategy_trades.get(name)
+        if info:
+            first = info.get("first_trade", "")
+            days = "?"
+            if first:
+                try:
+                    first_dt = datetime.fromisoformat(first.replace("Z", "+00:00"))
+                    days = (run_time - first_dt).days
+                except (ValueError, TypeError):
+                    pass
+            strat_lines += f"\n  • {name}: Day {days}/14, {info['trade_count']} trades"
+        else:
+            strat_lines += f"\n  • {name}: awaiting first trade"
+
+    strategy_block = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🍳 <b>EL CHEF</b>\n"
+        f"  Last run:        {chef_run}\n"
+        f"  Strategy:        {chef_strat}\n"
+        f"  Backtest result: {chef_bt}\n"
+        f"  WR: {chef_wr} | PF: {chef_pf} | DD: {chef_dd}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔧 <b>EL MECÁNICO</b>\n"
+        f"  Last run:        {mec_run}\n"
+        f"  Strategy:        {mec_strat}\n"
+        f"  Attempt:         {mec_attempt}/{mec_max}\n"
+        f"  Result:          {mec_result}\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>VALIDATED STRATEGIES</b>\n"
+        f"  Total validated: {len(validated)}\n"
+        f"  In paper trading: {', '.join(validated) if validated else 'none'}"
+        f"{strat_lines}\n"
+    )
 
     # Hardware block
     temp_str = _temp_indicator(hw_stats.get("cpu_temp_c"))
@@ -615,6 +843,8 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>PAPER TRADING</b>\n"
         f"{trade_block}\n"
+        f"\n"
+        f"{strategy_block}"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌡️ <b>HARDWARE</b>\n"
@@ -828,6 +1058,15 @@ def main() -> None:
     # Market maker stats
     mm_stats = query_mm_today()
 
+    # Strategy activity
+    print("[la_perra] Collecting strategy activity...")
+    chef = get_el_chef_activity()
+    mecanico = get_el_mecanico_activity()
+    strats = get_validated_strategies()
+    print(f"[la_perra] Chef: {chef['strategy'] or 'none'} | "
+          f"Mecánico: {mecanico['strategy'] or 'none'} | "
+          f"Validated: {len(strats['validated'])}")
+
     # Save to database
     print("[la_perra] Saving daily costs to database...")
     save_daily_costs(hw_stats, api_costs, elec)
@@ -835,7 +1074,8 @@ def main() -> None:
 
     # Build daily message
     message = format_telegram_message(findings, claude_analysis, run_time,
-                                      hw_stats, api_costs, elec, mm_stats)
+                                      hw_stats, api_costs, elec, mm_stats,
+                                      chef=chef, mecanico=mecanico, strats=strats)
 
     # Check if weekly summary needed (Saturday)
     if run_time.weekday() == 5:  # Saturday
