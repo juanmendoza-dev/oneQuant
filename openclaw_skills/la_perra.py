@@ -672,43 +672,58 @@ def _parse_rejected_slugs() -> set[str]:
         return set()
     rejected = set()
     for line in rejected_md.read_text(errors="replace").splitlines():
-        # Match lines like: **File:** `strategies/vwap_momentum.py`
         m = re.search(r"\*\*File:\*\*\s*`strategies/(\w+)\.py`", line)
         if m:
             rejected.add(m.group(1))
     return rejected
 
 
-def _check_results_pass() -> set[str]:
-    """Check results/ for strategies with PASS verdict."""
+def _get_results_data() -> tuple[set[str], list[dict]]:
+    """Read results/ JSONs. Return (passed_slugs, recent_failures).
+
+    recent_failures contains dicts for FAIL/ERROR results from last 24h.
+    """
     passed = set()
+    recent_failures: list[dict] = []
     results_dir = ONEQUANT_DIR / "results"
     if not results_dir.exists():
-        return passed
+        return passed, recent_failures
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     for f in results_dir.glob("*.json"):
         try:
             data = json.loads(f.read_text(errors="replace"))
-            if data.get("verdict") == "PASS":
-                slug = data.get("slug", "")
-                if slug:
-                    passed.add(slug)
         except (json.JSONDecodeError, OSError):
-            pass
-    return passed
+            continue
+        verdict = data.get("verdict", "")
+        slug = data.get("slug", "")
+        if verdict == "PASS" and slug:
+            passed.add(slug)
+        elif verdict in ("FAIL", "ERROR") and slug:
+            ts_str = data.get("timestamp", "")
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts >= cutoff:
+                    recent_failures.append(data)
+            except (ValueError, TypeError):
+                pass
+    return passed, recent_failures
 
 
 # Strategies that are not directional trading strategies
 NON_DIRECTIONAL = {"market_maker"}
 
-# Strategies known to have passed full backtest validation
+# Known validated strategies with their backtest stats
 # (validated before results/ logging existed)
-KNOWN_VALIDATED = {"mean_reversion"}
+KNOWN_VALIDATED = {
+    "mean_reversion": {"wr": 76.8, "pf": 2.10},
+}
 
 
 def get_validated_strategies() -> dict:
-    """List genuinely validated strategies, excluding rejected ones."""
+    """Gather strategy data for the report."""
     rejected = _parse_rejected_slugs()
-    results_passed = _check_results_pass()
+    results_passed, recent_failures = _get_results_data()
 
     all_strats = []
     if STRATEGIES_DIR.exists():
@@ -718,21 +733,15 @@ def get_validated_strategies() -> dict:
                 continue
             all_strats.append(name)
 
-    # A strategy is validated if:
-    # 1. It has a PASS in results/, OR
-    # 2. It's in KNOWN_VALIDATED (pre-dates results/ logging)
-    # AND it's not in REJECTED.md and not a non-directional strategy
     validated = []
     non_directional = []
-    rejected_present = []
     for name in all_strats:
         if name in NON_DIRECTIONAL:
             non_directional.append(name)
         elif name in rejected:
-            rejected_present.append(name)
+            pass  # skip rejected strategies still in folder
         elif name in results_passed or name in KNOWN_VALIDATED:
             validated.append(name)
-        # else: strategy file exists but has no validation — don't list
 
     # Query paper trades grouped by strategy
     strategy_trades = {}
@@ -758,7 +767,7 @@ def get_validated_strategies() -> dict:
     return {
         "validated": validated,
         "non_directional": non_directional,
-        "rejected_present": rejected_present,
+        "recent_failures": recent_failures,
         "strategy_trades": strategy_trades,
     }
 
@@ -834,10 +843,42 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
 
     validated = strats.get("validated", [])
     non_directional = strats.get("non_directional", [])
-    rejected_present = strats.get("rejected_present", [])
+    recent_failures = strats.get("recent_failures", [])
     strategy_trades = strats.get("strategy_trades", {})
 
-    strat_lines = ""
+    # --- Passed section ---
+    passed_lines = ""
+    for name in validated:
+        stats = KNOWN_VALIDATED.get(name)
+        if stats:
+            passed_lines += f"\n     • {name} (WR {stats['wr']}%, PF {stats['pf']:.2f})"
+        else:
+            passed_lines += f"\n     • {name}"
+    if not passed_lines:
+        passed_lines = "\n     • none"
+
+    # --- Failed last night section ---
+    failed_lines = ""
+    for f in recent_failures:
+        name = f.get("strategy_name") or f.get("slug", "unknown")
+        reason = f.get("failure_reason", "unknown")
+        wr = f.get("win_rate_pct", 0)
+        pf = f.get("profit_factor", 0)
+        # Truncate long reasons
+        if len(reason) > 40:
+            reason = reason[:37] + "..."
+        failed_lines += f"\n     • {name} — {reason} (WR {wr:.0f}%, PF {pf:.2f})"
+    if not failed_lines:
+        failed_lines = "\n     • none"
+
+    # --- Being fixed section ---
+    if mec_strat and mec_strat != "none":
+        fixing_lines = f"\n     • {mec_strat} — attempt {mec_attempt}/{mec_max}"
+    else:
+        fixing_lines = "\n     • none"
+
+    # --- Paper trading section ---
+    paper_lines = ""
     for name in validated:
         info = strategy_trades.get(name)
         if info:
@@ -849,19 +890,13 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
                     days = (run_time - first_dt).days
                 except (ValueError, TypeError):
                     pass
-            strat_lines += f"\n  • {name}: Day {days}/14, {info['trade_count']} trades"
+            paper_lines += f"\n     • {name} — Day {days}/14, {info['trade_count']} trades"
         else:
-            strat_lines += f"\n  • {name}: awaiting first trade"
-
-    if non_directional:
-        strat_lines += f"\n  ─────────────────────────"
-        for name in non_directional:
-            strat_lines += f"\n  ⚙️ {name} (non-directional)"
-
-    if rejected_present:
-        strat_lines += f"\n  ─────────────────────────"
-        for name in rejected_present:
-            strat_lines += f"\n  ❌ {name} (REJECTED — should remove)"
+            paper_lines += f"\n     • {name} — Day 0, 0 trades"
+    for name in non_directional:
+        paper_lines += f"\n     • {name} — {mm_stats['round_trips']} round trips today"
+    if not paper_lines:
+        paper_lines = "\n     • none"
 
     strategy_block = (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -872,17 +907,14 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
         f"  WR: {chef_wr} | PF: {chef_pf} | DD: {chef_dd}\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔧 <b>EL MECÁNICO</b>\n"
-        f"  Last run:        {mec_run}\n"
-        f"  Strategy:        {mec_strat}\n"
-        f"  Attempt:         {mec_attempt}/{mec_max}\n"
-        f"  Result:          {mec_result}\n"
+        f"📋 <b>STRATEGIES</b>\n"
+        f"  ✅ Passed:{passed_lines}\n"
         f"\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 <b>VALIDATED STRATEGIES</b>\n"
-        f"  Total validated: {len(validated)}\n"
-        f"  In paper trading: {', '.join(validated) if validated else 'none'}"
-        f"{strat_lines}\n"
+        f"  ❌ Failed last night:{failed_lines}\n"
+        f"\n"
+        f"  🔧 Being Fixed (El Mecánico):{fixing_lines}\n"
+        f"\n"
+        f"  📈 Paper Trading:{paper_lines}\n"
     )
 
     # Hardware block
