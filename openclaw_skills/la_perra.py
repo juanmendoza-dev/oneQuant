@@ -665,15 +665,74 @@ def get_el_mecanico_activity() -> dict:
             "max_attempts": 5, "result": result}
 
 
+def _parse_rejected_slugs() -> set[str]:
+    """Parse REJECTED.md to get slugs of rejected strategies."""
+    rejected_md = STRATEGIES_DIR / "REJECTED.md"
+    if not rejected_md.exists():
+        return set()
+    rejected = set()
+    for line in rejected_md.read_text(errors="replace").splitlines():
+        # Match lines like: **File:** `strategies/vwap_momentum.py`
+        m = re.search(r"\*\*File:\*\*\s*`strategies/(\w+)\.py`", line)
+        if m:
+            rejected.add(m.group(1))
+    return rejected
+
+
+def _check_results_pass() -> set[str]:
+    """Check results/ for strategies with PASS verdict."""
+    passed = set()
+    results_dir = ONEQUANT_DIR / "results"
+    if not results_dir.exists():
+        return passed
+    for f in results_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(errors="replace"))
+            if data.get("verdict") == "PASS":
+                slug = data.get("slug", "")
+                if slug:
+                    passed.add(slug)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return passed
+
+
+# Strategies that are not directional trading strategies
+NON_DIRECTIONAL = {"market_maker"}
+
+# Strategies known to have passed full backtest validation
+# (validated before results/ logging existed)
+KNOWN_VALIDATED = {"mean_reversion"}
+
+
 def get_validated_strategies() -> dict:
-    """List validated (non-candidate) strategy files and paper trade info."""
-    validated = []
+    """List genuinely validated strategies, excluding rejected ones."""
+    rejected = _parse_rejected_slugs()
+    results_passed = _check_results_pass()
+
+    all_strats = []
     if STRATEGIES_DIR.exists():
         for f in sorted(STRATEGIES_DIR.glob("*.py")):
             name = f.stem
             if name.startswith("candidate_") or name in ("__init__", "base"):
                 continue
+            all_strats.append(name)
+
+    # A strategy is validated if:
+    # 1. It has a PASS in results/, OR
+    # 2. It's in KNOWN_VALIDATED (pre-dates results/ logging)
+    # AND it's not in REJECTED.md and not a non-directional strategy
+    validated = []
+    non_directional = []
+    rejected_present = []
+    for name in all_strats:
+        if name in NON_DIRECTIONAL:
+            non_directional.append(name)
+        elif name in rejected:
+            rejected_present.append(name)
+        elif name in results_passed or name in KNOWN_VALIDATED:
             validated.append(name)
+        # else: strategy file exists but has no validation — don't list
 
     # Query paper trades grouped by strategy
     strategy_trades = {}
@@ -696,7 +755,12 @@ def get_validated_strategies() -> dict:
         except sqlite3.Error:
             pass
 
-    return {"validated": validated, "strategy_trades": strategy_trades}
+    return {
+        "validated": validated,
+        "non_directional": non_directional,
+        "rejected_present": rejected_present,
+        "strategy_trades": strategy_trades,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -769,8 +833,10 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
     mec_result = mecanico.get("result") or "not run"
 
     validated = strats.get("validated", [])
+    non_directional = strats.get("non_directional", [])
+    rejected_present = strats.get("rejected_present", [])
     strategy_trades = strats.get("strategy_trades", {})
-    in_paper = [v for v in validated if v in strategy_trades or v not in ("market_maker",)]
+
     strat_lines = ""
     for name in validated:
         info = strategy_trades.get(name)
@@ -786,6 +852,16 @@ def format_telegram_message(findings: dict, claude_analysis: str, run_time: date
             strat_lines += f"\n  • {name}: Day {days}/14, {info['trade_count']} trades"
         else:
             strat_lines += f"\n  • {name}: awaiting first trade"
+
+    if non_directional:
+        strat_lines += f"\n  ─────────────────────────"
+        for name in non_directional:
+            strat_lines += f"\n  ⚙️ {name} (non-directional)"
+
+    if rejected_present:
+        strat_lines += f"\n  ─────────────────────────"
+        for name in rejected_present:
+            strat_lines += f"\n  ❌ {name} (REJECTED — should remove)"
 
     strategy_block = (
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
