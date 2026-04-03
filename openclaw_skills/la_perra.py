@@ -651,7 +651,14 @@ def get_el_mecanico_activity() -> dict:
         if ("strategy" in line.lower() or "attempting" in line.lower()) and not strategy:
             m = re.search(r"(?:strategy|attempting)[=:\s]+(\S+)", line, re.IGNORECASE)
             if m:
-                strategy = m.group(1)
+                candidate = m.group(1)
+                # Filter out common words that are not strategy names
+                _IGNORE_WORDS = {"saved", "fixed", "none", "pass", "fail",
+                                 "true", "false", "null", "error", "ok"}
+                if (len(candidate) >= 5
+                        and candidate.lower() not in _IGNORE_WORDS
+                        and re.match(r"^[a-z][a-z0-9_]*$", candidate)):
+                    strategy = candidate
         if "attempt" in line.lower() and attempt is None:
             m = re.search(r"attempt[=:\s]+(\d+)", line, re.IGNORECASE)
             if m:

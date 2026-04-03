@@ -391,6 +391,10 @@ def log_error(slug: str, strategy_name: str, error: str) -> None:
 def main() -> None:
     print("[el_chef] Starting strategy generation pipeline...")
 
+    # 0. Ensure working directory is onequant/ (backtest engine loads candles
+    #    from paths relative to cwd)
+    os.chdir(str(ONEQUANT_DIR))
+
     # 1. Rate limit check
     if not check_rate_limit():
         sys.exit(0)
